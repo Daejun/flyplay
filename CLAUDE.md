@@ -9,9 +9,14 @@ whole-body *Drosophila* biomechanics simulator on MuJoCo. Two goals drive every
 design decision here: **watch the fly move in real time**, and **see what it
 learns** under different conditions. Legibility beats raw training throughput.
 
-Not a package. No `pyproject.toml`, no `requirements.txt`, no git repository, no
-test framework. `flyplay/` is a plain directory importable because every script
-does `import _bootstrap` first.
+Not a package. No `pyproject.toml`, no `requirements.txt`, no test framework.
+`flyplay/` is a plain directory importable because every script does
+`import _bootstrap` first.
+
+A public git repository, https://github.com/Daejun/flyplay (branch `main`).
+`.gitignore` leaves out both virtual environments, `out/` and the two FlyGym
+reference clones (`flygym-src/`, `flygym-v1-src/`); commits use the account's
+noreply address. Commit or push only when the user asks.
 
 ## Running things
 
