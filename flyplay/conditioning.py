@@ -623,8 +623,7 @@ class ConditioningExperiment:
                 omission_dopamine += state.dan.get(target, 0.0) * self.dt
             self.last_state = state
             self.walker.descending_signal = self._steer()
-            for _ in range(self.steps_per_action):
-                self.walker.physics_step()
+            self.walker.advance(self.steps_per_action)
 
             pos = self.fs.thorax_pos()[:2]
             path.append(pos.copy())
@@ -726,8 +725,7 @@ class ConditioningExperiment:
                 omission_dopamine += state.dan.get(cfg.extinction, 0.0) * self.dt
             self.last_state = state
             self.walker.descending_signal = self._visual_command(state)
-            for _ in range(self.steps_per_action):
-                self.walker.physics_step()
+            self.walker.advance(self.steps_per_action)
 
             pos = self.fs.thorax_pos()[:2]
             path.append(pos.copy())

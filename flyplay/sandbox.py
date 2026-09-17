@@ -811,8 +811,7 @@ class Sandbox:
         self.fs.set_proboscis(1.0 if sipping else 0.0, lift)
         half = min(mid - SIGNAL_LOW, SIGNAL_HIGH - mid) if mid > 0 else 0.0
         self.walker.descending_signal = np.array([mid - half * turn, mid + half * turn])
-        for _ in range(self.steps_per_action):
-            self.walker.physics_step()
+        self.walker.advance(self.steps_per_action)
         self.time += self.dt
 
         # --- bookkeeping ---

@@ -171,6 +171,19 @@ change to how renderers are created, look at the eye panel, not just for errors.
 pillar in view pushes the horizon above it and obstacles read as zero forever.
 `ForageEnv` parks pillars at `PARKING_SPOT` for this one reading.
 
+**The walker's fast path must stay bit-identical to FlyGym's.** `Walker` runs
+`FastTurningController` (FlyGym's hybrid turning controller with its output
+order, phase-gain breakpoints and correction vectors built once),
+`ContactForces` (FlyGym's `get_bodysegment_contact_forces` with its lookups
+built once), and `Walker.advance`, which steps physics as one `mj_step(nstep)`
+call between controller updates. Same arithmetic, same order: checked against
+the stock pipeline (`from_sim`, `HybridTurningController`,
+`apply_locomotion_action`, single `sim.step`s) over 6000 updates in a walled
+room with stops and turns -- 0 mismatches in observations, ctrl, qpos, qvel and
+controller state -- and by the sandbox fingerprint. A sandbox fly went from 1378
+to 1212 ms per simulated second (0.73x to 0.83x). After a FlyGym upgrade, repeat
+that comparison before trusting any result.
+
 **Descending signal lives in [0.4, 1.6].** Below ~0.3 a tripod stalls, the fly
 pivots about the stalled side, and **the turn direction flips**. `SIGNAL_LOW` /
 `SIGNAL_HIGH` in `env.py` encode this; do not widen them.
@@ -532,6 +545,20 @@ readouts -- the CPU methods read `mj_data`, which GPU stepping never updates.
   test data at 275 characters, and pip stopped with `OSError: [Errno 2] No such
   file or directory`. The same install at `%TEMP%\fv\flyplay` (182 characters)
   took 199 s. Verify releases from a short path.
+- **Rendering goes to the RTX through `SHIM_MCCOMPAT`, set in
+  `flyplay/__init__.py`.** Left alone, MuJoCo's OpenGL (the fly's eyes, the
+  viewer's video) ran on "Intel(R) Graphics". The NVIDIA Optimus driver reads
+  `SHIM_MCCOMPAT=0x800000001` when a context is created, so it steers this
+  process and its children only -- not every Python program, as the Windows
+  per-app Graphics setting on `python.exe` would. Measured: an eye render and
+  read-back 10.9-16.5 ms on Intel, 0.9-1.9 ms on the RTX; the viewer's 1280x720
+  frame with JPEG 17.3 ms to 8.5 ms; with 14 experiment workers busy, one fly's
+  eyes took 349-536 ms of a simulated second on Intel and 85-95 ms on the RTX.
+  The GPUs rasterise colour edges differently: over 114 fixed views the readouts
+  differed by at most 0.022, and 17 of 228 eye views got a visual Kenyon-cell
+  code differing in 1 of 5 cells. `10_sense_check.py` passes on both, but the
+  fingerprint changes; runs started before 2026-09-17 21:48 rendered on Intel.
+  `SHIM_MCCOMPAT=0x800000000` renders on Intel again.
 - **Console output must be ASCII.** The console is cp949; an em dash in a
   `print` raises `UnicodeEncodeError` and kills the process. Korean text in
   `.md` files is fine — this applies to stdout only.

@@ -2076,8 +2076,7 @@ class FlyServer:
                     SIGNAL_LOW,
                     SIGNAL_HIGH,
                 )
-                for _ in range(steps_per_frame):
-                    self.walker.physics_step()
+                self.walker.advance(steps_per_frame)
 
             if self._reset_pacer:
                 # A trial rewound sim.time, so the pacer's anchor is in the

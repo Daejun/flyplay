@@ -230,8 +230,7 @@ class FlyNavEnv(gym.Env):
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
         self.walker.descending_signal = self.action_to_signal(action)
 
-        for _ in range(self.steps_per_action):
-            self.walker.physics_step()
+        self.walker.advance(self.steps_per_action)
 
         self._step_count += 1
         pos = self.fs.thorax_pos()
