@@ -25,7 +25,12 @@ git clone https://github.com/Daejun/flyplay.git
 cd flyplay
 ```
 
-**2. 가상환경과 패키지.** 약 450 MB를 내려받고, 설치하면 약 1.4 GB가 됩니다.
+Windows에서는 `C:\Users\이름\flyplay`처럼 짧은 경로에 받으세요. 폴더가 깊으면 설치 중 가장 긴 파일 경로가
+260자를 넘어 `OSError: [Errno 2] No such file or directory`로 실패합니다(깊은 임시 폴더에 받았을 때 실제로
+이렇게 실패했습니다). Windows의 긴 경로 지원을 켜도 됩니다.
+
+**2. 가상환경과 패키지.** 패키지 약 320 MB를 내려받고(가장 큰 것은 torch CPU판 124 MB), 설치하면
+가상환경이 약 1.4 GB가 됩니다. 새 환경에서 3분 남짓 걸렸습니다.
 
 ```bash
 py -3.12 -m venv .venv
@@ -40,7 +45,7 @@ py -3.12 -m venv .venv
 
 화면이 없는 리눅스 서버에서는 `MUJOCO_GL=egl`도 필요합니다.
 
-**3. 설치 확인.** 두 스크립트 모두 모든 항목이 PASS면 됩니다.
+**3. 설치 확인.** 버섯체 점검 29개와 감각 점검 10개가 모두 PASS면 됩니다. 각각 1분 안에 끝납니다.
 
 ```bash
 .venv\Scripts\python.exe scripts\13_mb_check.py --no-plot

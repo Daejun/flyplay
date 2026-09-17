@@ -507,6 +507,11 @@ noslip iterations (MJWarp drops them), is what the missing 2x would cost.
 
 ## Windows specifics
 
+- **`pip install -r requirements.txt` fails in a deep folder.** Long paths are
+  not enabled here: a fresh clone in this session's scratchpad put setuptools'
+  test data at 275 characters, and pip stopped with `OSError: [Errno 2] No such
+  file or directory`. The same install at `%TEMP%\fv\flyplay` (182 characters)
+  took 199 s. Verify releases from a short path.
 - **Console output must be ASCII.** The console is cp949; an em dash in a
   `print` raises `UnicodeEncodeError` and kills the process. Korean text in
   `.md` files is fine — this applies to stdout only.
