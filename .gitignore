@@ -1,0 +1,17 @@
+# Virtual environments: FlyGym 2.x (.venv) and 1.x (.venv-v1), 2.4 GB together
+.venv/
+.venv-v1/
+
+# Reference clones of the upstream FlyGym repositories (README, section 2)
+flygym-src/
+flygym-v1-src/
+
+# Checkpoints, TensorBoard logs, experiment records and videos written by the scripts
+out/
+
+__pycache__/
+*.pyc
+
+# Local tool state
+.claude/settings.local.json
+.playwright-mcp/
