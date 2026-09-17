@@ -9,14 +9,24 @@ whole-body *Drosophila* biomechanics simulator on MuJoCo. Two goals drive every
 design decision here: **watch the fly move in real time**, and **see what it
 learns** under different conditions. Legibility beats raw training throughput.
 
-Not a package. No `pyproject.toml`, no `requirements.txt`, no test framework.
+Not a package. No `pyproject.toml` and no test framework; `requirements.txt`
+pins what the scripts import (`requirements-gpu.txt` adds MuJoCo Warp).
 `flyplay/` is a plain directory importable because every script does
 `import _bootstrap` first.
 
-A public git repository, https://github.com/Daejun/flyplay (branch `main`).
-`.gitignore` leaves out both virtual environments, `out/` and the two FlyGym
-reference clones (`flygym-src/`, `flygym-v1-src/`); commits use the account's
-noreply address. Commit or push only when the user asks.
+A public git repository, https://github.com/Daejun/flyplay. `.gitignore` leaves
+out both virtual environments, `out/` and the two FlyGym reference clones
+(`flygym-src/`, `flygym-v1-src/`); commits use the account's noreply address.
+Commit or push only when the user asks.
+
+**Branches and releases.** Work happens on `main`. `release` is the GitHub default
+branch, the one people clone, and moves only to a commit that installed and ran
+from a fresh clone: a new venv from `requirements.txt` (pinned to the versions
+tested here), `13_mb_check.py --no-plot` and `10_sense_check.py` passing, the
+sandbox viewer answering `/state`. Each such commit gets a tag `vX.Y.Z` and a
+GitHub release made with `gh` (`C:\Program Files\GitHub CLI\gh.exe`, not on the
+Git Bash PATH). Keep the README's quick start in step with what that check ran.
+Docs use paths relative to the project root, never this machine's home folder.
 
 ## Running things
 
@@ -24,7 +34,7 @@ Always use the venv interpreter explicitly — there is no activation step in
 these workflows:
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\09_web_viewer.py --odor --pillars 4
+.venv\Scripts\python.exe scripts\09_web_viewer.py --odor --pillars 4
 ```
 
 `.venv` is FlyGym **2.x** (Python 3.12, torch CPU-only). `.venv-v1` is a
@@ -36,7 +46,7 @@ Scripts are numbered in dependency order and each carries a usage block in its
 module docstring. The ones that matter most:
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\10_sense_check.py
+.venv\Scripts\python.exe scripts\10_sense_check.py
 ```
 
 `10_sense_check.py` is the closest thing to a test suite: 10 pass/fail checks
@@ -48,7 +58,7 @@ and that the eyes read painted floor colour on the correct side.
 anything else.
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\13_mb_check.py
+.venv\Scripts\python.exe scripts\13_mb_check.py
 ```
 
 The mushroom-body counterpart: 29 pass/fail checks (16 smell, 13 vision), pure
@@ -62,7 +72,7 @@ dir>`. Trained flies are filed and restored with `16_memory.py`. The planned
 programme these belong to, and its progress, is in [PLAN.md](PLAN.md).
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\11_train_forage.py --resume --steps 150000 250000 250000 --n-envs 6 --checkpoint-every 8000
+.venv\Scripts\python.exe scripts\11_train_forage.py --resume --steps 150000 250000 250000 --n-envs 6 --checkpoint-every 8000
 ```
 
 Three-stage curriculum with weight transfer. `--resume` continues each stage
@@ -71,11 +81,11 @@ from its newest checkpoint and skips finished ones; without it, the run
 `--steps` as the original run or the targets will not match.
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\tensorboard.exe --logdir out/rl/tb
+.venv\Scripts\tensorboard.exe --logdir out/rl/tb
 ```
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\17_run_experiment.py --set shock_odour --flies 8
+.venv\Scripts\python.exe scripts\17_run_experiment.py --set shock_odour --flies 8
 ```
 
 Runs one of the sandbox's A/B experiment sets (`--list` names them) on all but

@@ -1,0 +1,9 @@
+flyplay
+Copyright 2026 Daejun
+
+This project runs on FlyGym / NeuroMechFly v2 (https://github.com/NeLy-EPFL/flygym),
+Copyright 2023-2026 The NeuroMechFly v2 Authors, licensed under the Apache License 2.0.
+
+flyplay/odor.py re-implements on FlyGym 2.x the olfaction of FlyGym 1.x
+(https://github.com/NeLy-EPFL/flygym-gymnasium, Apache License 2.0), with the
+same sensor placement.

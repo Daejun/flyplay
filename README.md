@@ -1,29 +1,91 @@
-# FlyGym / NeuroMechFly v2 — 이 PC 실행 환경
+# flyplay — NeuroMechFly v2 초파리 작업대
 
-초파리(*Drosophila melanogaster*) 전신 생체역학 시뮬레이터 **NeuroMechFly v2**를
-이 컴퓨터에서 바로 돌릴 수 있도록 설치·검증하고, 두 가지 목적에 맞춘 스크립트를
-준비해 두었습니다.
+초파리(*Drosophila melanogaster*) 전신 생체역학 시뮬레이터 **NeuroMechFly v2**(FlyGym 2.1) 위에서
+초파리가 움직이는 모습을 실시간으로 보고, 무엇을 배우는지 보는 스크립트 모음입니다.
 
 1. **실시간으로 초파리가 걷는 모습 보기** — 브라우저에서 직접 조종 (`scripts/09`)
 2. **상황별로 초파리가 무엇을 학습하는지 보기** — 지형별 조향 학습 (`scripts/05~07`)
 3. **냄새와 시각을 함께 쓰는 학습** — 논문 Figure 5 과제 재구현 (`scripts/10~12`)
 4. **버섯체가 냄새와 벌을 연합하는 학습** — 후각 조건화, 강화학습 없이 시냅스
    가소성만으로 (`scripts/13~15`, `09 --conditioning`)
+5. **샌드박스와 A/B 실험실** — 방을 꾸며 반응을 보고, 한 가지만 다른 두 조건을 쌍둥이 초파리로 비교해
+   탐구 보고서까지 (`09 --sandbox`, `scripts/17`)
 
-> 지금 어디까지 학습됐고 어떻게 이어서 돌리는지는 **[STATUS.md](STATUS.md)**에
-> 있습니다.
+## 빠른 시작
 
-> **이 저장소에 없는 것.** 가상환경(`.venv`, `.venv-v1`), 스크립트가 만드는 학습·실험 결과(`out/`),
-> 참고용으로 받아 둔 FlyGym 저장소 두 개(`flygym-src/`, `flygym-v1-src/`)는 올리지 않았습니다.
-> 문서의 `C:\Users\...\fly` 경로는 처음 설치한 PC 기준입니다. 참고 저장소는 프로젝트 루트에서 이렇게 받습니다.
->
-> ```bash
-> git clone https://github.com/NeLy-EPFL/flygym.git flygym-src
-> ```
->
-> ```bash
-> git clone https://github.com/NeLy-EPFL/flygym-gymnasium.git flygym-v1-src
-> ```
+검증한 환경은 Windows 11과 Python 3.12.10입니다(FlyGym 2.1은 Python 3.12~3.14가 필요합니다). 리눅스와
+macOS에서는 아직 돌려 보지 않았습니다. 아래 명령은 Windows 기준이고, macOS·리눅스에서는
+`.venv\Scripts\python.exe` 대신 `.venv/bin/python`을 쓰고 경로의 `\`를 `/`로 바꾸면 됩니다.
+
+**1. 받기.** 기본 브랜치 `release`에는 새 환경에 설치해 돌아가는 것을 확인한 버전만 올라갑니다. 압축
+파일은 [Releases](https://github.com/Daejun/flyplay/releases)에 있습니다.
+
+```bash
+git clone https://github.com/Daejun/flyplay.git
+cd flyplay
+```
+
+**2. 가상환경과 패키지.** 약 450 MB를 내려받고, 설치하면 약 1.4 GB가 됩니다.
+
+```bash
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+리눅스에서는 pip가 torch를 GPU판(수 GB)으로 받습니다. 위 설치 전에 CPU판을 먼저 까세요.
+
+```bash
+.venv/bin/python -m pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+```
+
+화면이 없는 리눅스 서버에서는 `MUJOCO_GL=egl`도 필요합니다.
+
+**3. 설치 확인.** 두 스크립트 모두 모든 항목이 PASS면 됩니다.
+
+```bash
+.venv\Scripts\python.exe scripts\13_mb_check.py --no-plot
+.venv\Scripts\python.exe scripts\10_sense_check.py
+```
+
+**4. 샌드박스 뷰어.**
+
+```bash
+.venv\Scripts\python.exe scripts\09_web_viewer.py --sandbox
+```
+
+브라우저에서 <http://localhost:8000>을 엽니다. 오른쪽 지도에 설탕·전기·냄새·색 바닥·벽을 놓고 초파리의
+반응을 보고, 영상 아래 **A/B 실험실**에서 질문을 골라 배경 실험을 돌린 뒤 판정과 탐구 보고서를 봅니다.
+배경 실험은 CPU 코어를 두 개만 남기고 모두 씁니다. 명령줄에서 쓸 수 있는 실험 세트 목록:
+
+```bash
+.venv\Scripts\python.exe scripts\17_run_experiment.py --list
+```
+
+다른 모드와 스크립트는 [3. 바로 실행하기](#3-바로-실행하기)부터 이어집니다. 학습된 정책(`out/rl/`)은
+저장소에 없으므로, 뷰어의 `--policy`와 `--follow`는 `scripts\05_train.py`나 `scripts\11_train_forage.py`로
+먼저 학습한 뒤에 씁니다. 개발 PC에서의 학습 상황은 [STATUS.md](STATUS.md)에 있습니다.
+
+### 저장소에 없는 것
+
+가상환경(`.venv`, `.venv-v1`), 스크립트가 만드는 학습·실험 결과(`out/`), 참고용으로 받아 둔 FlyGym 저장소
+두 개(`flygym-src/`, `flygym-v1-src/`)는 올리지 않았습니다. 참고 저장소는 프로젝트 루트에서 이렇게 받습니다.
+
+```bash
+git clone https://github.com/NeLy-EPFL/flygym.git flygym-src
+git clone https://github.com/NeLy-EPFL/flygym-gymnasium.git flygym-v1-src
+```
+
+GPU 벤치마크(`scripts\08_gpu_benchmark.py`)는 `requirements-gpu.txt`를 더 설치해야 합니다.
+
+### 브랜치와 라이선스
+
+- `release`(기본 브랜치) — 새로 받은 코드를 새 가상환경에 설치해 점검 스크립트와 샌드박스 뷰어가 도는 것을
+  확인한 버전입니다. 확인할 때마다 `v0.1.0` 같은 태그와 [Releases](https://github.com/Daejun/flyplay/releases)
+  항목을 만듭니다.
+- `main` — 개발 중인 버전입니다.
+
+[Apache License 2.0](LICENSE)을 따릅니다. FlyGym/NeuroMechFly v2(Apache-2.0) 위에서 만들었고, 출처는
+[NOTICE](NOTICE)에 있습니다.
 
 ---
 
@@ -55,7 +117,7 @@
 
 ## 2. 설치된 것
 
-가상환경: `C:\Users\pdaej\fly\.venv` (Python 3.12.10)
+가상환경: `.venv` (Python 3.12.10, 개발 PC 기준)
 
 | 패키지 | 버전 |
 |---|---|
@@ -69,7 +131,7 @@
 10개가 `flygym-src/tutorials/`에 있습니다.
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe -m ipykernel install --user --name flygym
+.venv\Scripts\python.exe -m ipykernel install --user --name flygym
 ```
 
 > **GPU 관련.** PyPI의 Windows용 torch 기본 휠은 CPU 전용이라 `torch 2.14.0+cpu`가
@@ -82,7 +144,7 @@ C:\Users\pdaej\fly\.venv\Scripts\python.exe -m ipykernel install --user --name f
 
 ## 3. 바로 실행하기
 
-모든 스크립트는 `--help`가 있습니다. 아래는 프로젝트 루트(`C:\Users\pdaej\fly`)에서 실행합니다.
+모든 스크립트는 `--help`가 있습니다. 아래는 프로젝트 루트에서 실행합니다.
 
 ### 브라우저에서 조종하기 ★ (권장)
 
@@ -550,7 +612,7 @@ RL 환경의 낙하 판정도 고쳤습니다. 초파리는 공중에서 스폰�
 ## 9. 프로젝트 구조
 
 ```
-C:\Users\pdaej\fly\
+flyplay\                        프로젝트 루트
 ├── .venv\                      가상환경
 ├── flygym-src\                 FlyGym 저장소 원본 (튜토리얼 10개 + 소스 참고용)
 ├── flyplay\

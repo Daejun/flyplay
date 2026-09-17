@@ -1,0 +1,5 @@
+# Only for scripts/08_gpu_benchmark.py: MuJoCo Warp on an NVIDIA GPU.
+# Tested with an RTX 5060, CUDA Toolkit 12.9, driver 13.3.
+-r requirements.txt
+warp-lang==1.14.0
+mujoco-warp==3.9.0.1

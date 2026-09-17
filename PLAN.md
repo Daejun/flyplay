@@ -496,27 +496,27 @@ scripts/22_run_room.py, 23_analyze_room.py                                (B-4)
 ## 검증
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\13_mb_check.py
+.venv\Scripts\python.exe scripts\13_mb_check.py
 ```
 
 기존 16항목 + 시각 항목. 몇 초.
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\10_sense_check.py
+.venv\Scripts\python.exe scripts\10_sense_check.py
 ```
 
 기존 7항목 + 바닥 색 좌우 신호, 실행 중 색 변경.
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\14_run_conditioning.py --experiment colour
+.venv\Scripts\python.exe scripts\14_run_conditioning.py --experiment colour
 ```
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\15_analyze_mb.py --dir out\mb_colour
+.venv\Scripts\python.exe scripts\15_analyze_mb.py --dir out\mb_colour
 ```
 
 ```bash
-C:\Users\pdaej\fly\.venv\Scripts\python.exe scripts\09_web_viewer.py --conditioning --modality colour --port 8010
+.venv\Scripts\python.exe scripts\09_web_viewer.py --conditioning --modality colour --port 8010
 ```
 
 B 단계 검증 명령은 B-2·B-3 확정 후 추가합니다.
