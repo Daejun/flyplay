@@ -70,17 +70,22 @@ from flyplay.experiment import (
 
 
 def write_status(directory: Path, protocol: Protocol, state: str, started: float, **extra) -> None:
+    """Progress for the viewer. Only advisory: a status file that cannot be
+    written is reported and skipped, never the end of the run."""
     done = len(read_records(directory))
-    write_json(directory / "status.json", {
-        "state": state,
-        "pid": os.getpid(),
-        "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
-        "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "elapsed_s": round(time.time() - started, 1),
-        "done_trials": done,
-        "total_trials": protocol.total_trials(),
-        **extra,
-    })
+    try:
+        write_json(directory / "status.json", {
+            "state": state,
+            "pid": os.getpid(),
+            "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
+            "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_s": round(time.time() - started, 1),
+            "done_trials": done,
+            "total_trials": protocol.total_trials(),
+            **extra,
+        })
+    except OSError as error:
+        print(f"  status not written: {error!r}", file=sys.stderr, flush=True)
 
 
 def finish(directory: Path) -> None:

@@ -414,11 +414,23 @@ found it too hard to use. The lab (`labOpen`/`labGo`) walks through question ->
 hypothesis and start -> result and replays; the tab under the video keeps only
 an open button and the last three runs.
 
-**A tab plays one video stream.** Each stream holds one of the browser's six
-connections to this server for as long as it plays, across all tabs. Opening the
-lab removes `#view`'s `src`; the lab's own `<img>` gets `/stream` only on the
-result screen, and closing puts both back. The replay bar is a single element
-moved into the lab's video and back, so its handlers stay bound.
+**A tab plays one video stream, and only while it is on screen.** Each stream
+holds one of the browser's six connections to this server for as long as it
+plays, across all tabs. `syncStreams()` decides every `<img>`'s `src` from what
+is visible: `#view` unless the tab is hidden or the lab is open, the lab's own
+video only on its result screen, the eye mosaic only in modes that show it. The
+replay bar is a single element moved into the lab's video and back, so its
+handlers stay bound.
+
+**The server draws only for watchers.** `/stream` and `/eyes` connections are
+counted (`FlyServer.watch`); with none, `_render` skips the scene render and
+`_render_eyes` the mosaic, and `/neuro`'s payload is not built without a poll in
+the last 2 s. Measured on the sandbox: a 1280x720 frame with its JPEG 17.3 ms,
+the mosaic 2.2 ms, one 10 ms step 13.1 ms -- at 25 fps the two display costs
+took half of each wall second from the simulation thread. Panels of other modes
+start `display:none` in the markup: the eye mosaic, odour trace and attribution
+panels showed for a moment in the sandbox before the first `/state` arrived. The
+page's draw functions return early for canvases `onScreen` rejects.
 
 **The server answers `exp_start` before the run exists** (commands queue for the
 sim thread; `/sandbox` returns 204). The lab recognises its run as the first
@@ -504,6 +516,14 @@ pilots or sweeps on your own -- offer the command.
 against 6.5x for 14 CPU processes running the whole fly. Porting the controller,
 the mushroom body and the eyes to batched form, and re-validating walking without
 noslip iterations (MJWarp drops them), is what the missing 2x would cost.
+The sandbox's own model (room pools, 756 leg-vs-wall pairs, proboscis) walks as
+fast as FlyGym's plain fly: 64/256/1024 worlds at 5.0/9.2/12.5x total, 4.7/8.8/
+12.2x with a 500 Hz CPU round trip. 2048 worlds filled the laptop GPU's 8 GB
+(7.9 GB used) and had not finished 0.2 s in 16 min, so about 1024 is the ceiling
+here; below about 100 flies the CPU pool is faster. MJWarp also refuses a pair
+margin while MULTICCD is on (the model's pairs carry 0.001): set margins to 0
+for a GPU copy. `GPUSimulation` has no contact forces, per-world reset or eye
+readouts -- the CPU methods read `mj_data`, which GPU stepping never updates.
 
 ## Windows specifics
 

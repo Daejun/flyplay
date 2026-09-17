@@ -308,6 +308,14 @@ class FlyServer:
         self._new_frame = threading.Condition(self._frame_lock)
         self._eye_frame: bytes | None = None
         self._eye_lock = threading.Condition(threading.Lock())
+        #: Open /stream and /eyes connections, and when /neuro was last asked
+        #: for: nothing is drawn that no page is looking at. Measured on the
+        #: sandbox: a 1280x720 frame with its JPEG costs 17.3 ms and the eye
+        #: mosaic 2.2 ms, against 13.1 ms for one 10 ms step -- at 25 fps the two
+        #: took half of every wall second from the simulation thread.
+        self._watchers = {"stream": 0, "eyes": 0}
+        self._watchers_lock = threading.Lock()
+        self._neuro_asked = 0.0
         self._stop = threading.Event()
         self.status: dict = {}
         self.neuro_snapshot: dict = {}
@@ -2084,7 +2092,12 @@ class FlyServer:
         self.renderer.close()
         self.fs.close()
 
-    def _render(self):
+    def watch(self, stream: str, change: int) -> None:
+        """Count a page joining (+1) or leaving (-1) the /stream or /eyes feed."""
+        with self._watchers_lock:
+            self._watchers[stream] += change
+
+    def _render_scene(self) -> bytes:
         self.renderer.update_scene(self.fs.sim.mj_data, self.cam)
         colours = getattr(self, "_display_colours", None)
         if colours:
@@ -2098,6 +2111,12 @@ class FlyServer:
         rgb = self.renderer.render()
         buf = io.BytesIO()
         Image.fromarray(rgb).save(buf, format="JPEG", quality=80)
+        return buf.getvalue()
+
+    def _render(self):
+        # No page on /stream (a background tab, the A/B lab without its video):
+        # no picture, while everything /state reports keeps updating.
+        frame = self._render_scene() if self._watchers["stream"] else None
 
         pos = self.fs.thorax_pos()
         left, right = self.walker.descending_signal
@@ -2184,13 +2203,16 @@ class FlyServer:
                 self.status["bearing"] = round(
                     float(np.rad2deg(self.env.goal_bearing()))
                 )
-        with self._new_frame:
-            self._frame = buf.getvalue()
-            self._new_frame.notify_all()
+        if frame is not None:
+            with self._new_frame:
+                self._frame = frame
+                self._new_frame.notify_all()
 
         self._sample_body()
         self._render_eyes()
-        self.neuro_snapshot = self._build_neuro_payload()
+        # The dashboard polls every 250 ms; 2 s without a poll means no page draws it.
+        if not self.neuro_snapshot or time.monotonic() - self._neuro_asked < 2.0:
+            self.neuro_snapshot = self._build_neuro_payload()
 
     def _sample_body(self) -> None:
         """Sample the signals that do not need the policy, at the frame rate."""
@@ -2212,8 +2234,11 @@ class FlyServer:
 
         Reuses whatever the environment already rendered for its own
         observation -- an eye render costs 25 ms, so paying for a second one
-        just to draw it would halve the frame rate.
+        just to draw it would halve the frame rate. Skipped while no page shows
+        the eye panel, which the sandbox never does.
         """
+        if not self._watchers["eyes"]:
+            return
         retina = self.fs.sim.retina
         if self.sandbox_mode:
             readouts = self.sandbox._readouts
@@ -2854,7 +2879,7 @@ PAGE = """<!doctype html>
         <canvas id="c_map"></canvas>
       </div>
     </div>
-    <div class="card" id="eyecard">
+    <div class="card" id="eyecard" style="display:none">
       <div class="cap" id="eyecap">겹눈이 보는 화면
         <small>왼쪽 눈 | 오른쪽 눈. 먹이는 <b style="color:#c9863f">안 보이고</b>(냄새로만 찾음),
           기둥은 보입니다.</small>
@@ -2898,7 +2923,7 @@ PAGE = """<!doctype html>
       </div>
       <div class="plot"><canvas id="c_learn"></canvas></div>
     </div>
-    <div class="card" id="odorcard">
+    <div class="card" id="odorcard" style="display:none">
       <div class="cap">냄새
         <small>왼쪽·오른쪽 센서가 느끼는 냄새 세기의 시간 변화입니다. 두 선의 차이가 조향 신호이고,
           초파리는 그 차이를 따라 냄새 쪽(또는 학습 후 반대쪽)으로 돕니다.</small>
@@ -2909,14 +2934,14 @@ PAGE = """<!doctype html>
 </main>
 
 <footer>
-  <div class="card" id="attrcard">
+  <div class="card" id="attrcard" style="display:none">
     <div class="cap">감각 기여도 — 지금
       <small>각 감각 입력을 조금씩 흔들었을 때 조향 명령이 얼마나 바뀌는지입니다. 높을수록 정책이
         그 감각에 의존하고 있다는 뜻입니다. 세로 점선은 에피소드 경계입니다.</small>
     </div>
     <div class="plot"><canvas id="c_attr"></canvas></div>
   </div>
-  <div class="card" id="attrhistcard">
+  <div class="card" id="attrhistcard" style="display:none">
     <div class="cap">감각 기여도 — 학습 경과
       <small>디스크의 체크포인트마다 같은 상태 묶음 64개로 측정했습니다. 같은 입력으로 쟀기 때문에
         차이는 정책이 바뀐 결과입니다. 막대가 자라면 학습이 그 감각을 쓰기 시작한 것입니다.</small>
@@ -3136,6 +3161,9 @@ function fitCanvases() {
 addEventListener('resize', fitCanvases);
 
 const ctx = id => document.getElementById(id).getContext('2d');
+// Nothing is drawn that nobody can see: a hidden card, the page under the A/B
+// lab, or a tab in the background. Only called once the whole script has run.
+const onScreen = c => !document.hidden && !lab.open && c.canvas.offsetParent !== null;
 const clear = (c, bg='#111') => {
   c.fillStyle = bg; c.fillRect(0, 0, c.canvas.width, c.canvas.height);
 };
@@ -3145,6 +3173,7 @@ const text = (c, s, x, y, col='#8a8a8a', size=10) => {
 };
 
 function traces(c, series, opts={}) {
+  if (!onScreen(c)) return;
   clear(c);
   const W = c.canvas.width, H = c.canvas.height, pad = 16;
   // Either bound may be pinned; whatever is left out is fitted to the data.
@@ -3201,6 +3230,7 @@ const ATTR_COLORS = ['#e0a24d', '#e0c24d', '#c98fd6', '#6ad07a'];
 // Grouped bars: one cluster per 10k training steps, one bar per sense. Reading
 // left to right is reading the training run.
 function attrBars(c, history, channels, ready) {
+  if (!onScreen(c)) return;
   clear(c);
   const W = c.canvas.width, H = c.canvas.height;
   const padL = 30, padB = 26, padT = 16;
@@ -3248,6 +3278,7 @@ function attrBars(c, history, channels, ready) {
 // keeps 99 of them -- so "still the same dots" really does mean "the same
 // smell, only nearer".
 function kcRaster(c, active, refs, odour, n) {
+  if (!onScreen(c)) return;
   clear(c);
   const W = c.canvas.width, H = c.canvas.height, foot = 12;
   // Columns from the aspect ratio, so the cells stay square in whichever panel
@@ -3284,6 +3315,7 @@ const SWATCH = {blue:['#5b8fe8', '#1f3560'], green:['#4fbf5a', '#1f4a24'],
 // constellation. Measured: blue and green light disjoint sets of cells, so a
 // panel whose bright cells sit on the blue backdrop is an eye looking at blue.
 function vkcRaster(c, active, refs, stimuli, n, under) {
+  if (!onScreen(c)) return;
   clear(c);
   const W = c.canvas.width, H = c.canvas.height, foot = 13, gap = 10;
   const pw = (W - gap) / 2, ph = H - foot;
@@ -3312,6 +3344,7 @@ function vkcRaster(c, active, refs, stimuli, n, under) {
 // VPN outputs, one row per eye: colour VPNs in the colour they prefer, then the
 // brightness bands in grey from dark to bright.
 function vpnBars(c, vpn, labels) {
+  if (!onScreen(c)) return;
   clear(c);
   const W = c.canvas.width, H = c.canvas.height, gap = 16, top = 12;
   if (!vpn) { text(c, '눈이 아직 렌더되지 않았습니다', 10, 22); return; }
@@ -3480,6 +3513,7 @@ function describe(it) {
 }
 
 function drawMap(c) {
+  if (!onScreen(c)) return;
   clear(c, '#0d0d0d');
   const m = mapScale(c), h = sb.half;
   const [x0, y0] = toCanvas(c, -h, h);
@@ -3594,6 +3628,7 @@ function drawMap(c) {
 
 // Learned value per odour and colour, one bar each around zero.
 function learnBars(c, tel) {
+  if (!onScreen(c)) return;
   clear(c);
   const rows = [
     ...Object.entries(tel.odour_valence || {}).map(([k, v]) => ['냄새 ' + (ODOUR_KO[k] || k), v, ODOUR_COL[k]]),
@@ -3931,6 +3966,21 @@ function timeLeft(seconds) {
   if (seconds === null || seconds === undefined) return '';
   return seconds < 45 ? '곧 끝남' : '약 ' + Math.max(1, Math.round(seconds / 60)) + '분 남음';
 }
+// The server draws a picture only while a page is connected to its stream, so
+// streams follow what is on screen: a background tab, the page under the lab
+// and the eye panel outside the modes that show it all let go of theirs.
+let wantEyes = false;
+function setSrc(img, url) {
+  if (url === null) { if (img.hasAttribute('src')) img.removeAttribute('src'); }
+  else if (img.getAttribute('src') !== url) img.src = url;
+}
+function syncStreams() {
+  const shown = !document.hidden;
+  setSrc(view, shown && !lab.open ? '/stream' : null);
+  setSrc(labview, shown && lab.open && lab.view === 'result' ? '/stream' : null);
+  setSrc(eyeview, shown && !lab.open && wantEyes ? '/eyes' : null);
+}
+document.addEventListener('visibilitychange', syncStreams);
 function etaMinutes(set, flies) {
   const jobs = 2 * flies;
   return Math.max(1, Math.round(Math.ceil(jobs / lab.sets.workers) * set.seconds_per_fly / lab.sets.speed / 60));
@@ -3944,7 +3994,7 @@ function labOpen(where, arg) {
     document.body.style.overflow = 'hidden';
     // One video stream per tab: each holds a connection for as long as it
     // plays, and a browser allows six to this server across all of its tabs.
-    view.removeAttribute('src');
+    syncStreams();
   }
   labGo(where || lab.view, arg);
   labRefresh(true);
@@ -3954,9 +4004,8 @@ function labClose() {
   lab.open = false;
   labroot.style.display = 'none';
   document.body.style.overflow = '';
-  labview.removeAttribute('src');
   view.after(replaybar);
-  view.src = '/stream';
+  syncStreams();
 }
 function labGo(where, arg) {
   if (where === 'set' && arg && arg !== lab.key) {
@@ -3976,13 +4025,12 @@ function labGo(where, arg) {
   });
   if (where === 'result') {
     labvideo.appendChild(replaybar);
-    if (!labview.getAttribute('src')) labview.src = '/stream';
     lab.headHtml = '';
     renderLabResult();
   } else {
     view.after(replaybar);
-    labview.removeAttribute('src');
   }
+  syncStreams();
   if (where === 'home') renderLabHome();
   if (where === 'set') renderLabSet();
   labbody.scrollTop = 0;
@@ -4509,6 +4557,8 @@ const cs = {odor: ctx('c_odor'), attr: ctx('c_attr'), attrhist: ctx('c_attrhist'
             dan: ctx('c_dan')};
 
 setInterval(async () => {
+  // Not asking lets the server stop building the payload too.
+  if (document.hidden || lab.open) return;
   let n;
   try { n = await (await fetch('/neuro')).json(); } catch (e) { return; }
   // Empty until the simulation thread publishes its first snapshot, which is
@@ -4608,7 +4658,8 @@ function applyMode(s) {
     explainnow.innerHTML = '해 볼 것: 전기 구역에 <b>파란 바닥</b>을 겹쳐 두면 몇 번 맞은 뒤 파랑을 피하는지, 설탕에 <b>식초</b>를 ' +
       '겹쳐 두면 식초 쪽으로 곧장 가는지, 배고픔을 0으로 내리면 설탕을 지나치는지 보세요. 한계: 단서 없는 <b>장소</b>는 기억하지 ' +
       '못하고(중심복합체 몫, 아직 없음), 냄새는 지금 장애물을 통과해 퍼집니다. 소르비톨은 맛이 없어 초파리가 먹기 시작하지 않습니다.';
-    eyeview.removeAttribute('src');
+    wantEyes = false;
+    syncStreams();
     document.querySelector('[data-act=reset]').textContent = '새 파리 (방은 그대로)';
     document.querySelector('[data-act=reset]').title = '기억과 배고픔까지 모두 새로 시작하는 새 파리입니다. 방은 그대로입니다.';
     b_home.style.display = '';
@@ -4665,8 +4716,8 @@ function applyMode(s) {
   }
   // Only ask for the eye stream when something is rendering eyes. The odour
   // task runs vision=False, and an MJPEG request that never gets a frame hangs.
-  if (mode === 'odour') eyeview.removeAttribute('src');
-  else eyeview.src = '/eyes';
+  wantEyes = mode !== 'odour';
+  syncStreams();
   document.querySelector('[data-act=reset]').textContent = cond ? '새 파리' : '리셋';
   b_home.style.display = 'none';
   fitCanvases();
@@ -4891,6 +4942,8 @@ def make_handler(server: FlyServer):
                 self.end_headers()
                 self.wfile.write(body)
             elif self.path in ("/state", "/neuro"):
+                if self.path == "/neuro":
+                    server._neuro_asked = time.monotonic()
                 data = (
                     server.status if self.path == "/state" else server.neuro_snapshot
                 )
@@ -4940,6 +4993,7 @@ def make_handler(server: FlyServer):
                     "Content-Type", "multipart/x-mixed-replace; boundary=frame"
                 )
                 self.end_headers()
+                server.watch("eyes", +1)
                 try:
                     while True:
                         frame = server.next_eye_frame()
@@ -4957,12 +5011,15 @@ def make_handler(server: FlyServer):
                     # (WinError 10053), which slipped past those and printed a
                     # full traceback every time a browser tab was closed.
                     pass
+                finally:
+                    server.watch("eyes", -1)
             elif self.path == "/stream":
                 self.send_response(200)
                 self.send_header(
                     "Content-Type", "multipart/x-mixed-replace; boundary=frame"
                 )
                 self.end_headers()
+                server.watch("stream", +1)
                 try:
                     while True:
                         frame = server.next_frame()
@@ -4980,6 +5037,8 @@ def make_handler(server: FlyServer):
                     # (WinError 10053), which slipped past those and printed a
                     # full traceback every time a browser tab was closed.
                     pass
+                finally:
+                    server.watch("stream", -1)
             else:
                 self.send_error(404)
 

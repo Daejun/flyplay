@@ -426,10 +426,22 @@ def new_experiment_dir(root: Path = EXPERIMENTS_DIR, tag: str = "exp") -> Path:
 
 
 def write_json(path: Path, data) -> None:
-    """Written whole and renamed into place, so a reader never sees half a file."""
+    """Written whole and renamed into place, so a reader never sees half a file.
+
+    Windows refuses the rename while another process has the file open, and the
+    viewer opens status.json every few seconds to show progress: a run died on
+    exactly that after 20 of 20 trials (PermissionError, WinError 5), before its
+    CSV and report were written. The rename is retried for up to a second."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(path)
+    for attempt in range(40):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == 39:
+                raise
+            time.sleep(0.025)
 
 
 def read_json(path: Path, default=None):
