@@ -26,6 +26,12 @@ that arc, and corridors narrower than about twice it cannot be turned around in.
 
 Geometry is 2-D and axis-aligned: every solid is a rectangle in the floor plane,
 which keeps ray casting exact and cheap.
+
+**Two things move by themselves**, for motion vision (`flyplay.motion_vision`):
+a striped drum turning round the outside of the room -- the optomotor stimulus
+-- and a dark bar sweeping over it, the passing shadow of Gibson et al. (2015).
+Each is one mocap body built with the room and parked under the floor until
+placed (`MOVING_KINDS`); they are seen, never touched or smelled.
 """
 
 from __future__ import annotations
@@ -46,17 +52,63 @@ WALL_THICKNESS = 2.0
 #: Where unused pool geoms wait, far outside the room and out of every sense.
 PARK_ORIGIN = (900.0, 900.0)
 
+#: Items that move by themselves, one of each at most (module docstring).
+MOVING_KINDS = ("drum", "shadow")
+#: The drum: stripes on a cylinder round the room, outside its walls (inner
+#: faces at 50 mm) and taller, so they fill the fly's view above them: from the
+#: centre the drum spans 0-30 degrees of elevation, the walls 0-7.
+DRUM_RADIUS = 70.0
+DRUM_HEIGHT = 40.0
+#: 10-degree stripes: dark and clear alternate into a 20-degree period, near
+#: the 20-22 degree wavelengths optomotor studies use (Seelig 2010, Mano 2023).
+DRUM_STRIPES = 36
+DRUM_RGBA = (0.04, 0.04, 0.05, 1.0)
+#: The drum's stripes darkened in its "landmarks" pattern (10 degrees each).
+LANDMARK_STRIPES = (*range(0, 9), 18, 25, 26, 27)
+#: The shadow: a dark bar crossing the room overhead, above the walls. Gibson
+#: et al. (2015) swept a paddle over a 100 mm arena at about 4.2 rad/s; this bar
+#: crosses at `SHADOW_SPEED`, one pass taking about half a second.
+SHADOW_HEIGHT = 30.0
+SHADOW_LENGTH = 140.0
+SHADOW_WIDTH = 20.0
+SHADOW_SPEED = 320.0
+SHADOW_RGBA = (0.02, 0.02, 0.02, 1.0)
+#: Where the moving stimuli wait: under the floor plane, out of every render.
+MOVING_PARK_Z = -300.0
+
 #: Pool sizes: how many of each item can be in the room at once. Doubling the
 #: obstacles from 8 to 16 took the contact pairs from 468 to 756 and left a
 #: sandbox step at 23.2 ms against 23.0 (T-maze, measured): parked geoms are
 #: culled by their bounds. The mazes among the presets need more than 8 walls.
-POOL_SIZES = {"obstacle": 16, "sugar": 12, "shock": 8, "patch": 12, "odour": 8}
+POOL_SIZES = {"obstacle": 16, "sugar": 12, "shock": 8, "patch": 12, "odour": 8, "heat": 8, "light": 4}
+#: Floor zones sensed through the legs or read by dopamine neurons directly,
+#: never seen: shock plates, heated floor, the light of an optogenetic zone.
+ZONE_KINDS = ("shock", "patch", "heat", "light")
 #: Default half-extent of an obstacle block, mm. Obstacles are resizable boxes
 #: -- a block or a long thin wall -- which means their bounding sphere
 #: (`geom_rbound`) and box (`geom_aabb`) must follow every resize: contacts come
 #: from explicit pairs culled by those bounds, and a stale bound silently drops
 #: them (see `Room._apply_params` and the measurement there).
 OBSTACLE_HALF = 4.0
+#: How near the thorax a solid has to be for its bounding sphere to be its real
+#: one; beyond that the sphere shrinks to `FAR_RBOUND` and MuJoCo's broad phase
+#: drops every pair with it (`Room.gate_bounds`). The room's walls are 104 mm
+#: long, so their spheres reach across the whole floor and every leg is tested
+#: against every wall on every step: collision detection was 313.5 ms of each
+#: simulated second, about two thirds of it walls. Measured over 20 s, with the
+#: gate against without, `qpos` fingerprints identical in each: `t_maze` 1469 ->
+#: 1039 ms of wall time per simulated second, `scented_sugar` 1206 -> 982,
+#: `obstacle_field` 1257 -> 1059, `corridor` 1328 -> 1186.
+#:
+#: 8 mm is the margin: the fly reaches 3.0 mm from its thorax to a tarsus tip
+#: and moves under 0.3 mm in the 10 ms between updates, so a solid that is
+#: gated off cannot be touched before the next update. In `corridor` and
+#: `t_maze` the thorax came within 1.2 and 0.8 mm of a solid and the gate was
+#: open there.
+GATE_MM = 8.0
+#: The bounding radius of a gated-off solid. **Not 0**: MuJoCo reads rbound 0 as
+#: "this geom is a plane" and stops filtering it at all.
+FAR_RBOUND = 1e-6
 #: Thinnest and longest an obstacle may be, as half-extents in mm. A wall is 2 mm
 #: thick like the room's own.
 OBSTACLE_MIN_HALF = 1.0
@@ -94,6 +146,11 @@ ROOM_FLOOR_RGBA = (0.06, 0.06, 0.065, 1.0)
 #: the 0.8 mm ball sat at head height and hid the head of a fly feeding at its
 #: drop. Only the marker moves; the smell source stays at 1.5 (`flyplay.sandbox`).
 FLOOR_Z, PATCH_Z, SHOCK_Z, SUGAR_Z, ODOUR_Z = 0.005, 0.015, 0.03, 0.045, 3.5
+HEAT_Z, LIGHT_Z = 0.035, 0.04
+#: Heat and light plates are invisible in every render, like shock plates: the
+#: fly feels heat and cannot see the red light CsChrimson is driven with. The
+#: viewer outlines them.
+ZONE_HIDDEN_RGBA = (1.0, 0.5, 0.1, 0.0)
 
 
 @dataclass(frozen=True)
@@ -210,7 +267,34 @@ def add_room(world, *, half: float = ROOM_HALF) -> None:
             size=(0.8, 0, 0), pos=parked(4, i, ODOUR_Z),
             rgba=ODOUR_MARKER_RGBA, contype=0, conaffinity=0, group=2,
         ))
-    world._flyplay_room = {"half": half, "walls": walls, "pools": pools}
+    for kind, index, z in (("heat", 5, HEAT_Z), ("light", 6, LIGHT_Z)):
+        for i in range(POOL_SIZES[kind]):
+            pools[kind].append(body.add_geom(
+                type=GEOM_TYPES["box"], name=f"room_{kind}_{i}",
+                size=(ZONE_HALF, ZONE_HALF, 0.005), pos=parked(index, i, z),
+                rgba=ZONE_HIDDEN_RGBA, contype=0, conaffinity=0, group=2,
+            ))
+    drum = body.add_body(name="room_drum", mocap=True, pos=(0.0, 0.0, MOVING_PARK_Z))
+    stripes = []
+    for i in range(DRUM_STRIPES):
+        phi = 2.0 * np.pi * (i + 0.5) / DRUM_STRIPES
+        # A little wider than the arc, so neighbouring dark stripes meet.
+        half_width = DRUM_RADIUS * np.pi / DRUM_STRIPES * 1.02
+        stripes.append(drum.add_geom(
+            type=GEOM_TYPES["box"], name=f"room_drum_{i}",
+            size=(0.5, half_width, DRUM_HEIGHT / 2),
+            pos=(DRUM_RADIUS * np.cos(phi), DRUM_RADIUS * np.sin(phi), DRUM_HEIGHT / 2),
+            quat=(np.cos(phi / 2), 0.0, 0.0, np.sin(phi / 2)),
+            rgba=DRUM_RGBA, contype=0, conaffinity=0,
+        ))
+    shadow = body.add_body(name="room_shadow", mocap=True, pos=(0.0, 0.0, MOVING_PARK_Z))
+    bar = shadow.add_geom(
+        type=GEOM_TYPES["box"], name="room_shadow_bar",
+        size=(SHADOW_WIDTH / 2, SHADOW_LENGTH / 2, 0.5), pos=(0.0, 0.0, 0.0),
+        rgba=SHADOW_RGBA, contype=0, conaffinity=0,
+    )
+    world._flyplay_room = {"half": half, "walls": walls, "pools": pools,
+                           "drum": drum, "drum_stripes": stripes, "shadow": shadow, "shadow_bar": bar}
 
 
 @dataclass
@@ -228,13 +312,18 @@ class Item:
 
     @property
     def extent(self) -> tuple[float, float]:
-        """Half-extents along x and y, mm."""
+        """Half-extents along x and y, mm. Moving stimuli have none on the floor."""
+        if self.kind in MOVING_KINDS:
+            return (0.0, 0.0)
         if self.kind == "obstacle":
             return (float(self.params.get("hx", OBSTACLE_HALF)),
                     float(self.params.get("hy", OBSTACLE_HALF)))
         if self.kind == "sugar":
             r = float(self.params.get("radius", SUGAR_RADIUS))
             return (r, r)
+        if "hx" in self.params:
+            # Heat zones may be rectangles, to tile a floor round a cool spot.
+            return (float(self.params["hx"]), float(self.params["hy"]))
         h = float(self.params.get("half", ZONE_HALF))
         return (h, h)
 
@@ -275,6 +364,22 @@ class Room:
         self.walls = wall_rects(self.half)
         self.solid_ids = np.array(list(self.wall_ids) + list(self.pool_ids["obstacle"]),
                                   dtype=np.int32)
+        body = lambda element: mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, element.name)
+        #: Mocap slots of the moving stimuli, and their geoms.
+        self.mocap = {"drum": int(model.body_mocapid[body(spec["drum"])]),
+                      "shadow": int(model.body_mocapid[body(spec["shadow"])])}
+        self.drum_geoms = np.array(ids(spec["drum_stripes"]), dtype=np.int32)
+        self.shadow_geom = ids([spec["shadow_bar"]])[0]
+        for kind in MOVING_KINDS:
+            self.slots[kind] = [None]
+        # Everything the fly can collide with, for `gate_bounds`. A wall keeps
+        # its compiled radius; an obstacle is resizable, so its radius is the
+        # expression `_apply_params` writes, read from the size it has now.
+        # Parked obstacles are gated off too: that is most of the 756 pairs.
+        self._gated: list[tuple[int, float | None]] = (
+            [(int(g), float(model.geom_rbound[g])) for g in self.wall_ids]
+            + [(int(g), None) for g in self.pool_ids["obstacle"]])
+        self._gate_on = False
 
     # --- editing ------------------------------------------------------------
 
@@ -301,6 +406,11 @@ class Room:
 
     def move(self, item_id: int, x: float, y: float) -> Item:
         item = self.items[item_id]
+        if item.kind in MOVING_KINDS:
+            # Nowhere in particular: the drum surrounds the room and the shadow
+            # crosses all of it. `animate` poses them.
+            item.x = item.y = 0.0
+            return item
         hx, hy = item.extent
         item.x = float(np.clip(x, -(self.half - hx), self.half - hx))
         item.y = float(np.clip(y, -(self.half - hy), self.half - hy))
@@ -318,6 +428,9 @@ class Room:
     def remove(self, item_id: int) -> None:
         item = self.items.pop(item_id)
         self.slots[item.kind][item.slot] = None
+        if item.kind in MOVING_KINDS:
+            self._park(item.kind)
+            return
         gid = self.pool_ids[item.kind][item.slot]
         self.sim.mj_model.geom_pos[gid] = self._parked[item.kind][item.slot]
 
@@ -325,8 +438,66 @@ class Room:
         for item_id in list(self.items):
             self.remove(item_id)
 
+    def _park(self, kind: str) -> None:
+        data = self.sim.mj_data
+        data.mocap_pos[self.mocap[kind]] = (0.0, 0.0, MOVING_PARK_Z)
+        data.mocap_quat[self.mocap[kind]] = (1.0, 0.0, 0.0, 0.0)
+
+    def animate(self, seconds: dict[str, float]) -> dict:
+        """Pose the moving stimuli for `seconds` since each was placed (a dict
+        by kind; kinds absent are skipped). Returns what the shadow is doing,
+        for counting passes: ``{"pass": k}`` while its k-th pass of the
+        current burst is overhead, else ``{}``."""
+        data = self.sim.mj_data
+        state: dict = {}
+        drum = next((i for i in self.items.values() if i.kind == "drum"), None)
+        if drum is not None and "drum" in seconds:
+            yaw = np.deg2rad(float(drum.params.get("offset", 0.0)) + float(drum.params.get("speed", 0.0)) * seconds["drum"])
+            data.mocap_pos[self.mocap["drum"]] = (0.0, 0.0, 0.0)
+            data.mocap_quat[self.mocap["drum"]] = (np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2))
+        shadow = next((i for i in self.items.values() if i.kind == "shadow"), None)
+        if shadow is not None and "shadow" in seconds:
+            p = shadow.params
+            span = 2.0 * (self.half + SHADOW_WIDTH)
+            crossing = span / SHADOW_SPEED
+            t = seconds["shadow"] % float(p.get("interval", 10.0))
+            k = int(t // float(p.get("gap", 1.0)))
+            into = t - k * float(p.get("gap", 1.0))
+            if k < int(p.get("passes", 1)) and into < crossing:
+                x = -span / 2 + SHADOW_SPEED * into
+                data.mocap_pos[self.mocap["shadow"]] = (x, 0.0, SHADOW_HEIGHT)
+                state = {"pass": k, "x": x}
+            else:
+                data.mocap_pos[self.mocap["shadow"]] = (0.0, 0.0, MOVING_PARK_Z)
+        return state
+
     def _apply_params(self, item: Item) -> None:
         model = self.sim.mj_model
+        if item.kind == "drum":
+            item.params["speed"] = float(np.clip(item.params.get("speed", 60.0), -180.0, 180.0))
+            # A turn of the whole pattern, degrees: the heat maze's probe rotates
+            # the panorama (Ofstad et al. 2011).
+            item.params["offset"] = float(item.params.get("offset", 0.0)) % 360.0
+            # A pattern with landmarks: dark sectors of 90, 10 and 30 degrees
+            # with unequal gaps, so no turn of it looks like another (Ofstad et
+            # al. 2011 used a panorama of distinct bars). Bars 40, 10 and 20
+            # degrees wide, tried first, let a put-down compass settle 65
+            # degrees off in one trial of four. "stripes" is the even grating.
+            pattern = item.params.get("pattern", "stripes")
+            if pattern == "landmarks":
+                dark = set(LANDMARK_STRIPES)
+            else:
+                pattern = "stripes"
+                dark = set(range(0, DRUM_STRIPES, 2))
+            item.params["pattern"] = pattern
+            for i, gid in enumerate(self.drum_geoms):
+                model.geom_rgba[gid] = DRUM_RGBA if i in dark else (0.0, 0.0, 0.0, 0.0)
+            return
+        if item.kind == "shadow":
+            item.params["interval"] = float(np.clip(item.params.get("interval", 10.0), 2.0, 120.0))
+            item.params["passes"] = int(np.clip(item.params.get("passes", 1), 1, 10))
+            item.params["gap"] = float(np.clip(item.params.get("gap", 1.0), 0.6, 5.0))
+            return
         gid = self.pool_ids[item.kind][item.slot]
         if item.kind == "obstacle":
             hx = float(np.clip(item.params.get("hx", OBSTACLE_HALF), OBSTACLE_MIN_HALF, OBSTACLE_MAX_HALF))
@@ -340,10 +511,12 @@ class Room:
             # the fly walks straight through to 25 mm past it.
             model.geom_rbound[gid] = float(np.linalg.norm(model.geom_size[gid]))
             model.geom_aabb[gid][3:5] = (hx, hy)
-        if item.kind in ("shock", "patch"):
+        if item.kind in ZONE_KINDS:
             half = float(np.clip(item.params.get("half", ZONE_HALF), 2.0, self.half))
             item.params["half"] = half
             model.geom_size[gid][:2] = half
+            if "hx" in item.params:
+                model.geom_size[gid][:2] = (item.params["hx"], item.params["hy"])
             # Kept in step with the size so nothing downstream culls the geom
             # by a stale bounding radius.
             model.geom_rbound[gid] = float(np.linalg.norm(model.geom_size[gid]))
@@ -358,6 +531,42 @@ class Room:
             model.geom_rgba[gid] = FLOOR_COLOURS[item.params.get("colour", "blue")]
         if "rgba" in item.params:
             model.geom_rgba[gid] = item.params["rgba"]
+
+    # --- collision bounds ----------------------------------------------------
+
+    def gate_bounds(self, x: float, y: float) -> None:
+        """Leave a real bounding sphere only on the solids near (x, y).
+
+        Call it right before stepping physics, with the thorax's position. See
+        `GATE_MM` for why this changes nothing the fly can feel: a pair that is
+        dropped could not have produced a contact before the next call.
+        """
+        model = self.sim.mj_model
+        for gid, compiled in self._gated:
+            pos, size = model.geom_pos[gid], model.geom_size[gid]
+            gap_x = abs(x - pos[0]) - size[0]
+            gap_y = abs(y - pos[1]) - size[1]
+            if max(gap_x, 0.0) ** 2 + max(gap_y, 0.0) ** 2 < GATE_MM * GATE_MM:
+                model.geom_rbound[gid] = compiled if compiled is not None else float(np.linalg.norm(size))
+            else:
+                model.geom_rbound[gid] = FAR_RBOUND
+        self._gate_on = True
+
+    def ungate(self) -> None:
+        """Put every bounding sphere back.
+
+        Physics that does not go through `gate_bounds` -- settling a body that
+        has just been set down somewhere else -- must call this first, or the
+        fly stands beside a wall whose sphere is still 1e-6 and walks through
+        it without a single contact.
+        """
+        if not self._gate_on:
+            return
+        model = self.sim.mj_model
+        for gid, compiled in self._gated:
+            model.geom_rbound[gid] = (compiled if compiled is not None
+                                      else float(np.linalg.norm(model.geom_size[gid])))
+        self._gate_on = False
 
     # --- reading ------------------------------------------------------------
 

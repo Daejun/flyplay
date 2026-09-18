@@ -7,3 +7,14 @@ Copyright 2023-2026 The NeuroMechFly v2 Authors, licensed under the Apache Licen
 flyplay/odor.py re-implements on FlyGym 2.x the olfaction of FlyGym 1.x
 (https://github.com/NeLy-EPFL/flygym-gymnasium, Apache License 2.0), with the
 same sensor placement.
+
+flyplay/data/ holds tables derived from published data, each under its own
+licence (details and rebuild command in flyplay/data/SOURCES.md):
+
+  door_odorants.csv  from DoOR 2.0.1 (Muench & Galizia 2016, Sci Rep 6:21841;
+                     https://github.com/ropensci/DoOR.data), CC BY-SA 4.0.
+                     This derived table is distributed under CC BY-SA 4.0.
+  hemibrain_kc.npz   from the hemibrain v1.2 connectome (Scheffer et al. 2020,
+                     eLife 9:e57443), CC BY 4.0, with glomerulus labels from
+                     Schlegel et al. 2021 (https://github.com/flyconnectome/
+                     hemibrain_olf_data), MIT License.

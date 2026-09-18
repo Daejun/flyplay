@@ -45,10 +45,15 @@ import os
 # 19.7 ms. Must be set before numpy and numba are first imported.
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 os.environ.setdefault("KMP_BLOCKTIME", "0")
-for _threads in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+# A worker pinned to one core has nothing to gain from numba's parallel loops:
+# its 16 OpenMP threads then share that one core (the fisheye correction took
+# 1.90 ms pinned against 1.82 ms on one thread). The correction is a pixel
+# copy, so the readout is the same whichever way it is split.
+for _threads in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMBA_NUM_THREADS"):
     os.environ.setdefault(_threads, "1")
 
 import argparse
+import multiprocessing
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -67,6 +72,33 @@ from flyplay.experiment import (
     run_fly_job,
     write_json,
 )
+
+
+def worker_cores(workers: int) -> list[int]:
+    """One core per worker, counting up from 1 so that core 0 is left to the
+    viewer and the desktop. Empty when there are not enough cores to go round:
+    pinning two workers onto one core is worse than letting Windows move them."""
+    n = os.cpu_count() or 1
+    return list(range(1, workers + 1)) if workers < n else []
+
+
+def pin_worker(cores: "multiprocessing.Queue[int]") -> None:
+    """Give this worker its own core.
+
+    A thread that holds an OpenGL context on the RTX is kept on the four P
+    cores by Windows however busy they are, and never moved to an E core --
+    measured on one process, 10 s: a plain Python loop used 0.96 of a core,
+    the same loop with an RTX context 0.37, with an Intel context 0.95, and
+    pinned to an E core 0.94. Every worker renders the eyes, so 14 of them
+    shared 4 cores. Pinned, the same 14 wall-following flies ran in 199-309 s
+    of wall time against 409-426 s, with identical records.
+    """
+    try:
+        import psutil
+
+        psutil.Process().cpu_affinity([cores.get_nowait()])
+    except Exception as error:  # noqa: BLE001 -- a slower run beats no run
+        print(f"  worker not pinned: {error!r}", file=sys.stderr, flush=True)
 
 
 def write_status(directory: Path, protocol: Protocol, state: str, started: float, **extra) -> None:
@@ -107,6 +139,8 @@ def main() -> None:
     parser.add_argument("--replay-flies", type=int, default=3,
                         help="Flies per condition recorded for replay (-1 all, 0 none).")
     parser.add_argument("--jobs", type=int, help="Worker processes (default: cores - 2).")
+    parser.add_argument("--no-pin", action="store_true",
+                        help="Let Windows place the workers (see pin_worker: about half the speed).")
     args = parser.parse_args()
 
     if args.list:
@@ -137,16 +171,26 @@ def main() -> None:
     jobs = jobs_for(protocol, directory)
     # Two cores stay free for the viewer and the desktop.
     workers = args.jobs or max(1, min(len(jobs), (os.cpu_count() or 4) - 2))
+    cores = [] if args.no_pin else worker_cores(workers)
     started = time.time()
     print(f"experiment {protocol.set_key} -> {directory}")
     print(f"  {len(protocol.conditions)} conditions x {protocol.flies} flies, "
           f"{protocol.total_trials()} trials, {protocol.simulated_seconds() / 60:.1f} simulated min, "
-          f"{workers} workers", flush=True)
-    write_status(directory, protocol, "running", started, workers=workers)
+          f"{workers} workers{', cores ' + str(cores[0]) + '-' + str(cores[-1]) if cores else ', not pinned'}",
+          flush=True)
+    write_status(directory, protocol, "running", started, workers=workers, pinned=bool(cores))
 
     state = "done"
+    pool_args = {}
+    if cores:
+        # The queue is passed as a Process argument, which is the one way a
+        # multiprocessing queue survives spawn; each worker takes one core.
+        queue: "multiprocessing.Queue[int]" = multiprocessing.Queue()
+        for core in cores:
+            queue.put(core)
+        pool_args = {"initializer": pin_worker, "initargs": (queue,)}
     try:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        with ProcessPoolExecutor(max_workers=workers, **pool_args) as pool:
             futures = [pool.submit(run_fly_job, job) for job in jobs]
             for future in as_completed(futures):
                 result = future.result()
@@ -154,21 +198,21 @@ def main() -> None:
                     state = "stopped"
                 print(f"  condition {result['condition']} fly {result['fly']:>3}: "
                       f"{result['trials']} trials in {result['wall_s']:.0f} s", flush=True)
-                write_status(directory, protocol, "running", started, workers=workers)
+                write_status(directory, protocol, "running", started, workers=workers, pinned=bool(cores))
     except BaseException as error:  # noqa: BLE001 -- recorded, then re-raised
         state = "failed"
-        write_status(directory, protocol, state, started, workers=workers, error=repr(error)[:300])
+        write_status(directory, protocol, state, started, workers=workers, pinned=bool(cores), error=repr(error)[:300])
         raise
     finally:
         if state != "failed":
             if (directory / "STOP").exists():
                 state = "stopped"
-            write_status(directory, protocol, "reporting", started, workers=workers)
+            write_status(directory, protocol, "reporting", started, workers=workers, pinned=bool(cores))
             try:
                 finish(directory)
             except Exception as error:  # noqa: BLE001 -- the records are what matters
                 print(f"  report failed: {error!r}", file=sys.stderr)
-            write_status(directory, protocol, state, started, workers=workers)
+            write_status(directory, protocol, state, started, workers=workers, pinned=bool(cores))
     print(f"{state} in {(time.time() - started) / 60:.1f} min")
 
 

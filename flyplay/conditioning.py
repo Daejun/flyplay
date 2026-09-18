@@ -342,7 +342,7 @@ class ConditioningExperiment:
                 if name not in FLOOR_COLOURS:
                     raise ValueError(f"unknown colour {name!r}; choose from {sorted(FLOOR_COLOURS)}")
                 self.fs.floor.paint_uniform(name)
-                self._unit_readouts[name] = self.fs.sim.get_ommatidia_readouts(self.fs.name).copy()
+                self._unit_readouts[name] = self.fs.ommatidia_readouts().copy()
         # Border-turn state for the colour steering; reset every trial.
         self._valence_trace: deque[float] = deque(maxlen=1)
         self._turn_steps_left = 0
@@ -714,7 +714,7 @@ class ConditioningExperiment:
 
         for i in range(steps):
             if i % look_every == 0:
-                readouts = self.fs.sim.get_ommatidia_readouts(self.fs.name)
+                readouts = self.fs.ommatidia_readouts()
             dan: dict[str, float] = {}
             if reinforced is not None and i % period >= period - pulse and not dan_blocked:
                 dan[target] = 1.0

@@ -13,6 +13,10 @@ Sections 7 and 8 check vision: the visual Kenyon-cell code on synthetic
 compound-eye readouts built from measured floor readings, then those cells
 sharing the compartments with smell.
 
+Section 9 checks the connectome front end the sandbox runs on (DoOR receptors,
+hemibrain claws, per-lobe APL) and compartments that read their own lobes.
+Sections 1-8 are about `OlfactoryFrontEnd`, which the conditioning tasks use.
+
     python scripts/13_mb_check.py
     python scripts/13_mb_check.py --no-plot
 
@@ -29,7 +33,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from flyplay.mushroom_body import Compartment, MushroomBody
-from flyplay.olfactory import OlfactoryFrontEnd, pattern_correlation
+from flyplay.olfactory import (
+    APL_BLOCKED,
+    LOBES,
+    ODORANT_BLENDS,
+    ConnectomeFrontEnd,
+    OlfactoryFrontEnd,
+    door_odorants,
+    hemibrain_kcs,
+    pattern_correlation,
+)
 from flyplay.visual_pathway import FLOOR_READINGS, VisualFrontEnd, floor_readouts
 
 OUT = _bootstrap.OUT / "mb"
@@ -91,6 +104,88 @@ def run_visual_trial(mb, readouts, dan_name=None, dan=1.0, odour=None):
 ISO_BLUE, ISO_GREEN = FLOOR_READINGS["blue"], FLOOR_READINGS["green"]
 GREEN_FULL = FLOOR_READINGS["green"]
 GREEN_TENTH = tuple(0.1 * v for v in GREEN_FULL)
+
+
+def connectome_checks() -> list[tuple[str, bool]]:
+    """Section 9. Returns (label, passed) pairs."""
+    out = []
+    room = ("vinegar", "octanol", "mch")
+    glomeruli, table = door_odorants()
+    data = hemibrain_kcs()
+    print(f"   data: {len(glomeruli)} glomeruli, {len(data['kc_type'])} Kenyon cells; "
+          f"3-octanol in DC2 (contaminant response, left out): {table['octanol'][glomeruli.index('DC2')]}")
+    out.append(("measured data load and agree", len(glomeruli) == 51 and len(data["kc_type"]) == 1927
+                and np.isnan(table["octanol"][glomeruli.index("DC2")])))
+
+    exact = ConnectomeFrontEnd(room, wiring="hemibrain")
+    claws = (exact.claws > 0).sum(axis=1)
+    by_lobe = {lobe: float(claws[exact.lobes == lobe].mean()) for lobe in LOBES}
+    print("   claws per cell, hemibrain: " + ", ".join(f"{k} {v:.2f}" for k, v in by_lobe.items())
+          + f", all {claws.mean():.2f} (light microscopy 5.2)")
+    fronts = [ConnectomeFrontEnd(room, seed=s) for s in range(N_SEEDS)]
+    same_counts = all(np.array_equal((f.claws > 0).sum(axis=1), claws) for f in fronts)
+    overlap = np.mean([((f.claws > 0) & (exact.claws > 0)).sum() / (exact.claws > 0).sum() for f in fronts])
+    usage = min(pattern_correlation(f.claws[f.kc_types == t].sum(axis=0), exact.claws[exact.kc_types == t].sum(axis=0))
+                for f in fronts for t in ("KCg-m", "KCab-s", "KCa'b'-m"))
+    print(f"   sampled flies: same claw counts per cell {same_counts}; claws shared with the hemibrain fly "
+          f"{overlap:.0%}; glomerulus usage per type vs hemibrain, worst cosine {usage:.3f}")
+    out.append(("sampled wiring: each fly its own claws, each type its own biases",
+                same_counts and overlap < 0.5 and usage > 0.9))
+
+    eye = np.eye(3)
+    invariance, vinegar, pairs, active, lobe_share = [], [], [], [], []
+    for f in fronts:
+        invariance += [pattern_correlation(f.encode(eye[i] * FAR), f.encode(eye[i] * NEAR)) for i in range(3)]
+        codes = [f.encode(eye[i] * MID) for i in range(3)]
+        vinegar += [pattern_correlation(codes[0], codes[1]), pattern_correlation(codes[0], codes[2])]
+        pairs.append(pattern_correlation(codes[1], codes[2]))
+        for code in codes:
+            active += [100 * (code[f.lobes == lobe] > 0).mean() for lobe in LOBES]
+            lobe_share.append(max(abs(code[f.lobes == lobe].sum() - (f.lobes == lobe).mean()) for lobe in LOBES))
+    affinity = {o: sum(s * np.nan_to_num(np.maximum(table[k], 0.0)) for k, s in ODORANT_BLENDS[o].items())
+                for o in room}
+    receptor_cos = pattern_correlation(affinity["octanol"], affinity["mch"])
+    print(f"   concentration x{NEAR / FAR:.0f}: worst code cosine {min(invariance):.3f}")
+    print(f"   vinegar against octanol or MCH: worst {max(vinegar):.3f}; octanol-MCH mean {np.mean(pairs):.3f} "
+          f"(range {min(pairs):.3f}-{max(pairs):.3f}), their receptor profiles {receptor_cos:.3f}")
+    print(f"   active cells per lobe, room odours: {min(active):.1f}-{max(active):.1f}% (median {np.median(active):.1f}%); "
+          f"lobe share of the code off by at most {max(lobe_share):.1e}")
+    out.append(("connectome code survives a concentration change", min(invariance) > 0.95))
+    out.append(("vinegar is coded apart from octanol and MCH", max(vinegar) < 0.1))
+    out.append(("Kenyon cells decorrelate octanol from MCH", np.mean(pairs) < receptor_cos))
+    out.append(("each lobe's code is sparse, 5-10% for the median odour",
+                2.0 < min(active) and max(active) < 15.0 and 5.0 <= np.median(active) <= 10.0))
+    out.append(("each lobe carries its share of the code", max(lobe_share) < 1e-9))
+
+    # Lin et al. (2014): blocking APL makes the code denser and similar
+    # mixtures harder to tell apart.
+    dense, similar = [], []
+    mix41, mix14 = np.array([0.0, 0.8, 0.2]) * MID, np.array([0.0, 0.2, 0.8]) * MID
+    for s in range(N_SEEDS):
+        intact = ConnectomeFrontEnd(room, seed=s)
+        blocked = ConnectomeFrontEnd(room, seed=s, apl=APL_BLOCKED)
+        dense.append((blocked.encode(eye[1] * MID) > 0).sum() / (intact.encode(eye[1] * MID) > 0).sum())
+        similar.append(pattern_correlation(blocked.encode(mix41), blocked.encode(mix14))
+                       - pattern_correlation(intact.encode(mix41), intact.encode(mix14)))
+    print(f"   APL blocked: {np.mean(dense):.1f}x the active cells; octanol:MCH 4:1 against 1:4 "
+          f"{np.mean(similar):+.3f} more alike (worse on {sum(d > 0 for d in similar)} of {N_SEEDS} flies)")
+    out.append(("APL block: denser code, similar mixtures more alike", np.mean(dense) > 2.0 and np.mean(similar) > 0))
+
+    # Compartments that read their lobes.
+    f = fronts[0]
+    gamma = f.lobes == "gamma"
+    fast = Compartment("gamma_only", +1.0, n_kc=f.n_kc, cells=gamma, coverage=float(gamma.mean()))
+    whole = Compartment("all", +1.0, n_kc=f.n_kc)
+    mb = MushroomBody(f, [fast, whole])
+    novel = [c.response(f.encode(eye[i] * MID)) for c in (fast,) for i in range(3)]
+    for _ in range(100):
+        mb.step(eye[2] * MID, {"gamma_only": 1.0}, DT)
+    outside_rest = bool(np.all(fast.weights[~gamma] == fast.w0))
+    print(f"   gamma-only compartment: novel odours read {np.round(novel, 6)}; "
+          f"after pairing, non-gamma synapses at rest {outside_rest}, MCH {fast.response(f.encode(eye[2] * MID)):.3f}")
+    out.append(("a compartment reads and changes only its own lobe's synapses",
+                np.allclose(novel, 1.0) and outside_rest and fast.response(f.encode(eye[2] * MID)) < 0.9))
+    return out
 
 
 def main() -> None:
@@ -398,6 +493,10 @@ def main() -> None:
                for a, b in zip(smell_only.compartments, with_eyes.compartments))
     print(f"   odour learning with eyes closed matches a smell-only fly exactly: {same}")
     passed.append(("vision changes nothing about smell when nothing is seen", same))
+
+    # --- 9. the connectome front end (the sandbox's) --------------------------
+    print("\n9. connectome front end: DoOR receptors, hemibrain claws, per-lobe APL")
+    passed.extend(connectome_checks())
 
     # --- summary ----------------------------------------------------------
     print("\n" + "=" * 58)

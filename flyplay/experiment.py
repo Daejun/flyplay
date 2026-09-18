@@ -51,7 +51,7 @@ EXPERIMENTS_DIR = ROOT / "out" / "experiments"
 
 ROLE_LABELS = {"test": "시험", "train": "훈련", "repeat": "반복"}
 #: Behaviour modes as small integers, for replay files.
-MODES = ("explore", "search", "feed", "retract", "escape", "wall")
+MODES = ("explore", "search", "feed", "retract", "escape", "wall", "freeze")
 #: Replay samples per simulated second. Walking cycles at about 12 Hz, so 25 Hz
 #: would show legs jumping between poses at slow playback; 50 Hz costs 0.85 MB
 #: per simulated minute compressed (measured) and replays 0.006 mm from the
@@ -102,7 +102,8 @@ class Condition:
 
     def changes(self) -> list[str]:
         """This condition's overrides, in words."""
-        kinds = {"sugar": "설탕", "shock": "전기", "odour": "냄새", "patch": "색 바닥", "obstacle": "벽·장애물"}
+        kinds = {"sugar": "설탕", "shock": "전기", "odour": "냄새", "patch": "색 바닥", "obstacle": "벽·장애물",
+                 "drum": "줄무늬 원통", "shadow": "그림자", "heat": "뜨거운 바닥", "light": "빛"}
         out = [f"{kinds.get(k, k)} 없음" for k in self.without]
         if self.volts is not None:
             out.append(f"전압 {self.volts:.0f} V")
@@ -572,6 +573,89 @@ def sign_test(wins: int, losses: int) -> float:
     return min(1.0, 2.0 * tail)
 
 
+#: What "believable" means to `pairs_needed`: the sign test's probability under
+#: 5% in 8 of 10 reruns of the same experiment. The textbook convention (alpha
+#: 0.05, power 0.8), picked for wording like the verdict's thresholds.
+BELIEVE_P = 0.05
+BELIEVE_REPEATS = 0.8
+#: Where `pairs_needed` gives up: past this the difference is too small, or too
+#: mixed, for any run the lab offers (at most 30 flies per condition, 50 from
+#: the command line).
+PAIRS_NEEDED_CAP = 200
+#: Effect sizes as words, upper bounds of |d_z|: Cohen's small, medium and large.
+EFFECT_WORDS = ((0.2, "거의 없음"), (0.5, "작음"), (0.8, "보통"), (math.inf, "큼"))
+
+
+def paired_effect(diffs: list[float]) -> float | None:
+    """How big the difference is next to how much it wobbles from pair to pair:
+    the mean pair difference over its standard deviation (Cohen's d_z). None
+    under `MIN_PAIRS` pairs. When every pair differs by exactly the same amount
+    the ratio is infinite; it is reported as 99 so the payload stays JSON
+    (``Infinity`` is not, and the page's JSON.parse rejects it)."""
+    if len(diffs) < MIN_PAIRS:
+        return None
+    arr = np.asarray(diffs, dtype=float)
+    sd = float(arr.std(ddof=1))
+    mean = float(arr.mean())
+    if sd == 0.0:
+        return 0.0 if mean == 0.0 else math.copysign(99.0, mean)
+    return float(np.clip(mean / sd, -99.0, 99.0))
+
+
+def effect_words(effect: float | None) -> str | None:
+    if effect is None:
+        return None
+    return next(words for bound, words in EFFECT_WORDS if abs(effect) < bound)
+
+
+def _upper_tails(n: int, p: float) -> list[float]:
+    """P(X >= k) for k = 0 .. n+1, X ~ Binomial(n, p), from log-space terms."""
+    if p <= 0.0:
+        return [1.0] + [0.0] * (n + 1)
+    if p >= 1.0:
+        return [1.0] * (n + 1) + [0.0]
+    lp, lq, lf = math.log(p), math.log1p(-p), math.lgamma(n + 1)
+    tails = [0.0] * (n + 2)
+    for k in range(n, -1, -1):
+        tails[k] = tails[k + 1] + math.exp(lf - math.lgamma(k + 1) - math.lgamma(n - k + 1) + k * lp + (n - k) * lq)
+    return [min(1.0, t) for t in tails]
+
+
+def pairs_needed(agree: int, disagree: int, ties: int) -> int | None:
+    """Pairs a rerun would need to show a split like this one believably.
+
+    Suppose each pair of the rerun goes this run's way with probability
+    ``(agree + 1) / (agree + disagree + 2)`` -- this run's share pulled toward a
+    coin flip, since three pairs out of three is weak evidence that every pair
+    would -- and ties as often as here. Returns the fewest pairs for which
+    `sign_test` would come out under `BELIEVE_P` in `BELIEVE_REPEATS` of reruns,
+    or None when this run points nowhere (no more agreeing pairs than
+    disagreeing) or would need more than `PAIRS_NEEDED_CAP`.
+
+    Computed: 3 agreeing pairs of 3 need 20 pairs, 8 of 8 need 12, 6 of 8
+    need 49, 5 of 8 need 199; 4 of 4 with 4 ties need 36. About 11 ms a call.
+    """
+    decided = agree + disagree
+    if decided == 0 or agree <= disagree:
+        return None
+    q = (agree + 1) / (decided + 2)
+    decide_share = decided / (decided + ties)
+    # Power of the sign test with d decided pairs, for every d up to the cap.
+    power = [0.0] * (PAIRS_NEEDED_CAP + 1)
+    for d in range(1, PAIRS_NEEDED_CAP + 1):
+        null = _upper_tails(d, 0.5)
+        k = next((k for k in range(d + 1) if 2.0 * null[k] <= BELIEVE_P), None)
+        if k is not None:
+            power[d] = _upper_tails(d, q)[k]
+    for n in range(MIN_PAIRS, PAIRS_NEEDED_CAP + 1):
+        # How many of n pairs are decided is itself binomial.
+        decided_at_least = _upper_tails(n, decide_share)
+        chance = sum((decided_at_least[d] - decided_at_least[d + 1]) * power[d] for d in range(1, n + 1))
+        if chance >= BELIEVE_REPEATS:
+            return n
+    return None
+
+
 def evaluate(protocol: Protocol, records: list[dict], expect: str | None = None) -> dict:
     """Compare condition A (0) with B (1) on the protocol's deciding measure.
 
@@ -616,6 +700,14 @@ def evaluate(protocol: Protocol, records: list[dict], expect: str | None = None)
     result["direction"] = direction
     consistent = (higher if direction == "A>B" else lower if direction == "A<B" else len(pairs) - higher - lower)
     result["consistent"] = consistent
+    result["effect"] = paired_effect(diffs)
+    result["effect_words"] = effect_words(result["effect"])
+    # Flies per condition to show this run's difference believably; nothing to
+    # show when the means are within the tolerance.
+    result["pairs_needed"] = None
+    if direction != "same" and len(pairs) >= MIN_PAIRS:
+        agree, disagree = (higher, lower) if direction == "A>B" else (lower, higher)
+        result["pairs_needed"] = pairs_needed(agree, disagree, len(pairs) - higher - lower)
     steady = consistent >= math.ceil(0.7 * len(pairs))
     if len(pairs) < MIN_PAIRS:
         result["verdict"] = "too_few"
@@ -747,23 +839,9 @@ _add(ExperimentSet(
         ("A<B", "소르비톨(B)을 자당(A)보다 더 오래 먹을 것이다"),
     ),
 ))
-_add(ExperimentSet(
-    "calories_fill", "먹이 찾기", "영양 없는 단맛도 배를 채울까?",
-    "단맛만 있고 영양이 없는 아라비노스를 먹어도 배고픔이 줄어들까?",
-    "자당 (영양 있음)", "아라비노스 (영양 없음)", "설탕에 영양이 있는가",
-    (Condition("A: 자당", [Step("repeat", "big_scented_sugar", 60.0, 3)], hunger=0.9, hold_hunger=False),
-     Condition("B: 아라비노스", [Step("repeat", "big_arabinose", 60.0, 3)], hunger=0.9, hold_hunger=False)),
-    "end_hunger", "last", "A<B",
-    "같은 파리가 세 번 먹은 뒤, 자당을 먹은 A가 아라비노스를 먹은 B보다 배고픔이 낮을 것이다.",
-    "이 모델에서 배고픔은 먹은 영양만큼 줄어듭니다. 아라비노스는 달지만 영양이 0입니다.",
-    "아라비노스는 단맛 기억만 짧게 남기고, 영양이 있는 당은 오래가는 기억을 만듭니다(Burke & Waddell 2011; "
-    "Huetteroth 등 2015).",
-    flies=8, also=("feed_s",),
-    outcomes=(
-        ("A<B", "자당을 먹은 A가 배고픔이 더 많이 줄어 있을 것이다"),
-        ("A>B", "아라비노스를 먹은 B가 배고픔이 더 많이 줄어 있을 것이다"),
-    ),
-))
+# No set asks whether a sweet sugar without calories fills the fly: hunger
+# falls only with calories by construction, so both answers were written in
+# advance (removed at the user's request).
 _add(ExperimentSet(
     "drop_size", "먹이 찾기", "방울이 크면 더 빨리 찾을까?",
     "냄새가 없을 때, 큰 설탕 방울이 작은 방울보다 더 빨리 발에 닿을까?",
@@ -1001,8 +1079,8 @@ _add(ExperimentSet(
     "shocks", "last", "A<B",
     "마지막 두 시행에서 냄새 단서가 있는 A가 냄새가 없는 B보다 전기를 적게 밟을 것이다.",
     "전기를 맞는 순간 맡고 있던 MCH의 가치가 음수가 되어, 다음에는 냄새가 진해지는 쪽을 피해 돕니다. 냄새가 "
-    "없으면 버섯체가 전기와 짝지을 것이 없어 매번 밟고 나서야 도망칩니다. 장소를 기억하는 뇌 영역은 이 모델에 "
-    "없습니다.",
+    "없으면 버섯체가 전기와 짝지을 것이 없어 매번 밟고 나서야 도망칩니다. 이 모델의 중심복합체는 뜨거운 바닥의 시원한 곳만 "
+    "목표로 기억하므로, 전기 구역의 자리는 외우지 않습니다.",
     "초파리는 냄새나 색 같은 단서와 짝지어진 벌을 배웁니다(Tully & Quinn 1985; Vogt 등 2014). 단서 없이 장소만으로 "
     "피하는 것은 heat box 실험처럼 따로 연구되며 버섯체가 필요 없습니다(Putz & Heisenberg 2002).",
     flies=8, also=("first_shock_s", "value_mch", "shock_s"),
@@ -1021,7 +1099,7 @@ _add(ExperimentSet(
      Condition("B: 냄새 없음", [Step("repeat", "t_maze", 90.0, 1)], same_fly=False, without=["odour"])),
     "first_feed_s", "all", "A<B",
     "냄새가 있는 A가 B보다 미로 속 설탕을 빨리 먹기 시작할 것이다.",
-    "냄새는 벽을 통과해 퍼지므로 갈림길에서 설탕 쪽이 더 진합니다.",
+    "냄새는 벽을 돌아 퍼지므로 갈림길에서 설탕이 있는 팔 쪽이 더 진합니다.",
     "걷는 초파리가 벽을 돌아 냄새를 따라간 실험 자료는 찾지 못했습니다. 이 결과는 모델의 예측으로 봐야 합니다.",
     flies=10, also=("first_touch_s", "distance_mm"),
     outcomes=(
@@ -1053,7 +1131,7 @@ _add(ExperimentSet(
      Condition("B: 벽 없음", [Step("repeat", "room_in_room", 90.0, 1)], same_fly=False, without=["obstacle"])),
     "first_feed_s", "all", "A>B",
     "벽에 둘러싸인 A가 B보다 설탕을 늦게 먹기 시작할 것이다.",
-    "냄새는 벽을 통과하지만 초파리는 문을 찾아야 들어갈 수 있습니다.",
+    "냄새는 문으로만 새어 나오고, 초파리도 그 문을 찾아야 들어갈 수 있습니다.",
     "이 모델의 예측입니다.",
     flies=10, also=("distance_mm",),
     outcomes=(
@@ -1069,9 +1147,9 @@ _add(ExperimentSet(
      Condition("B: 매번 새 파리", [Step("repeat", "t_maze_octanol", 60.0, 5)], same_fly=False, hunger=0.9)),
     "first_feed_s", "last", "A<B",
     "마지막 두 시행에서 같은 파리(A)가 새 파리(B)보다 빨리 설탕을 먹기 시작할 것이다.",
-    "이 모델은 길(장소)을 외우지 못합니다. 빨라진다면 설탕과 함께 맡은 옥탄올을 좋아하게 되어 갈림길에서 그쪽으로 "
-    "돌기 때문입니다. 결과를 보고 무엇 때문인지 생각해 보세요.",
-    "초파리의 장소 기억은 중심복합체가 맡습니다(Ofstad 등 2011). 이 모델에는 버섯체의 냄새·색 기억만 있습니다.",
+    "빨라진다면 설탕과 함께 맡은 옥탄올을 좋아하게 되어 갈림길에서 그쪽으로 돌기 때문일 수 있습니다. 이 모델의 중심복합체는 "
+    "뜨거운 바닥의 시원한 곳만 목표로 기억하므로, 이 미로의 길 자체는 외우지 않습니다.",
+    "초파리의 장소 기억은 중심복합체가 맡습니다(Ofstad 등 2011). 이 미로에서는 버섯체의 냄새 기억이 주로 쓰입니다.",
     flies=8, also=("value_octanol", "distance_mm"),
     outcomes=(
         ("A<B", "같은 파리인 A가 미로 속 설탕을 더 빨리 먹기 시작할 것이다"),
@@ -1079,12 +1157,110 @@ _add(ExperimentSet(
     ),
 ))
 
+# ---- places, heat, bitterness, light
+_add(ExperimentSet(
+    "place_memory", "장소 기억", "뜨거운 바닥에서 시원한 칸을 점점 빨리 찾을까?",
+    "방 바깥에 표지 막대가 있으면, 같은 초파리가 시원한 칸을 시행마다 더 빨리 찾게 될까?",
+    "표지 막대 있음", "표지 없음", "방 바깥의 표지 막대",
+    (Condition("A: 표지 막대 있음", [Step("repeat", "heat_maze", 60.0, 6)], hunger=0.5),
+     Condition("B: 표지 없음", [Step("repeat", "heat_maze_plain", 60.0, 6)], hunger=0.5)),
+    "first_cool_s", "last", "A<B",
+    "마지막 두 시행에서 표지 막대가 있는 A가 표지가 없는 B보다 시원한 칸을 빨리 찾을 것이다.",
+    "중심복합체 모형이 방향 감각(나침반), 지나온 길의 합(경로 적분), 기억한 목표를 맡습니다. 시원한 칸에 닿으면 그 자리를 "
+    "목표로 기억하고, 뜨거운 바닥에 서면 그쪽으로 돕니다. 그런데 초파리는 들어 올려졌다 놓일 때마다 방향 감각을 잃습니다. "
+    "표지 막대가 보이면 그 모양으로 방향을 되찾아 기억한 자리가 맞는 곳을 가리키지만, 표지가 없으면 엉뚱한 곳을 가리킵니다.",
+    "뜨거운 바닥(36 °C)의 시원한 칸 하나를 둘레의 막대 무늬로 기억해, 10번 시행하는 동안 찾는 시간이 절반으로 줄었습니다. "
+    "무늬를 돌리면 돌린 쪽을 찾았고, 이 기억에는 버섯체가 아니라 타원체(중심복합체)의 고리 뉴런이 필요했습니다(Ofstad 등 2011, Nature).",
+    flies=8, also=("hot_s", "distance_mm"),
+    outcomes=(
+        ("A<B", "표지 막대가 있는 A가 시원한 칸을 더 빨리 찾을 것이다"),
+        ("A>B", "표지가 없는 B가 시원한 칸을 더 빨리 찾을 것이다"),
+    ),
+))
+_add(ExperimentSet(
+    "bitter_food", "먹이 찾기", "쓴맛이 섞이면 덜 먹을까?",
+    "설탕물에 쓴맛을 섞으면 초파리가 덜 먹을까?",
+    "쓴맛 섞음", "쓴맛 없음", "설탕물의 쓴맛",
+    (Condition("A: 쓴맛 섞음", [Step("repeat", "bitter_sugar", 60.0, 1)], same_fly=False, hunger=0.9),
+     Condition("B: 쓴맛 없음", [Step("repeat", "scented_sugar", 60.0, 1)], same_fly=False, hunger=0.9)),
+    "feed_s", "all", "A<B",
+    "쓴맛을 섞은 A가 쓴맛이 없는 B보다 설탕을 먹은 시간이 짧을 것이다.",
+    "쓴맛은 같은 방울의 단맛 세포를 누르고(단맛 × (1 - 쓴맛)), 발에 닿는 동안 처벌 도파민을 냅니다. 남은 단맛이 약하면 먹기를 "
+    "시작하지 않습니다. 그래서 먹는 시간이 줄고, 함께 맡은 식초 냄새의 가치도 떨어질 수 있습니다.",
+    "쓴맛은 발의 단맛 세포 반응을 억누르고(Meunier 등 2003), 쓴맛(DEET)을 섞은 설탕과 짝지은 냄새는 곧바로 피하게 되었다가 "
+    "30분 뒤에는 좋아하게 됩니다(Das 등 2014). 쓴맛 처벌에는 PPL1 도파민 뉴런이 필요합니다(Kirkhart & Scott 2015).",
+    flies=10, also=("first_feed_s", "value_vinegar"),
+    outcomes=(
+        ("A<B", "쓴맛을 섞은 A를 더 짧게 먹을 것이다"),
+        ("A>B", "쓴맛이 없는 B를 더 짧게 먹을 것이다"),
+    ),
+))
+_add(ExperimentSet(
+    "light_learning", "배우기", "빛으로 도파민 뉴런을 켜도 냄새를 배울까?",
+    "전기 대신 빛으로 처벌 도파민 뉴런을 켜면서 옥탄올을 맡게 하면, 시험에서 옥탄올을 피할까?",
+    "처벌 빛 켬", "빛 없음", "훈련 방의 빛",
+    (Condition("A: 처벌 빛 켬", _learning("light_punish_odour", "odour_choice"), hunger=0.5),
+     Condition("B: 빛 없음", _learning("light_punish_odour", "odour_choice"), hunger=0.5, without=["light"])),
+    "odour_pi", "test", "A<B",
+    "처벌 빛을 받은 A가 B보다 시험에서 옥탄올을 더 피해 냄새 선호(옥탄올+)가 낮을 것이다.",
+    "빛 구역은 감각을 거치지 않고 처벌 도파민만 냅니다. 그때 켜져 있던 옥탄올 케니언 세포의 시냅스가 약해지는 것은 전기와 "
+    "똑같습니다. 전기와 달리 몸이 놀라 도망치지는 않습니다.",
+    "빛에 반응하는 이온 통로(CsChrimson)를 도파민 뉴런에 넣고 냄새와 함께 빛을 비추면, 전기나 설탕 없이도 기억이 생깁니다. "
+    "어느 도파민 뉴런을 켜느냐에 따라 기억이 빨리 생기거나 오래갑니다(Aso & Rubin 2016; Claridge-Chang 등 2009).",
+    flies=8, also=("value_octanol", "value_mch"),
+    outcomes=(
+        ("A<B", "처벌 빛을 받은 A가 옥탄올을 더 피할 것이다"),
+        ("A>B", "빛이 없던 B가 옥탄올을 더 피할 것이다"),
+    ),
+))
+
+# ---- seeing motion
+_add(ExperimentSet(
+    "optomotor", "움직임", "줄무늬가 돌면 초파리도 따라 돌까?",
+    "방 바깥의 줄무늬 원통이 반시계 방향으로 돌면, 초파리도 반시계 방향으로 돌까?",
+    "원통이 돎 (60°/s)", "원통이 멈춤", "줄무늬 원통이 도는가",
+    (Condition("A: 원통이 돎", [Step("repeat", "drum_turning", 30.0, 1)], same_fly=False),
+     Condition("B: 원통이 멈춤", [Step("repeat", "drum_still", 30.0, 1)], same_fly=False)),
+    "turn_ccw_dps", "all", "A>B",
+    "원통이 도는 A가 멈춘 B보다 반시계 방향으로 더 빨리 돌 것이다.",
+    "겹눈의 운동 감지 세포(T4·T5 모형)가 이웃한 낱눈 신호를 시간차를 두고 곱해 움직임의 방향을 알아냅니다. 시야 전체가 한쪽으로 "
+    "흐르면 그 방향으로 따라 돌도록 했습니다. 초파리가 스스로 방향을 휙 바꾸는 동안에는 이 반응을 끕니다.",
+    "돌아가는 줄무늬를 따라 도는 시운동 반응은 곤충 시각 연구의 가장 오래된 실험입니다(Götz & Wenking 1973). 걷는 초파리는 "
+    "줄무늬가 초당 1~8번 지나갈 때 가장 세게 따라 돌고, T4·T5 세포를 막으면 반응이 사라집니다(Creamer 등 2018; Mano 등 2023).",
+    flies=8, also=("distance_mm",),
+    outcomes=(
+        ("A>B", "원통이 도는 A가 반시계 방향으로 더 빨리 돌 것이다"),
+        ("A<B", "원통이 멈춘 B가 반시계 방향으로 더 빨리 돌 것이다"),
+    ),
+))
+_add(ExperimentSet(
+    "shadow_speed", "움직임", "머리 위로 그림자가 지나가면 더 빨리 걸을까?",
+    "검은 막대가 머리 위로 되풀이해 지나가면, 초파리가 더 빨리 걸을까?",
+    "그림자 있음", "그림자 없음", "머리 위로 지나가는 그림자",
+    (Condition("A: 그림자 있음", [Step("repeat", "shadow_bursts", 60.0, 1)], same_fly=False),
+     Condition("B: 그림자 없음", [Step("repeat", "shadow_bursts", 60.0, 1)], same_fly=False, without=["shadow"])),
+    "speed_mms", "all", "A>B",
+    "그림자가 지나가는 A가 그림자가 없는 B보다 평균 속도가 빠를 것이다.",
+    "눈 위쪽이 갑자기 어두워지면 그림자로 알아챕니다. 그때마다 각성이 1씩 쌓이고 약 20초에 걸쳐 가라앉는데, 각성만큼 걸음이 "
+    "빨라집니다. 대신 지나가는 순간 얼어붙기도 합니다(천천히 걷던 파리일수록 잘 얼어붙음). 두 효과 중 무엇이 이길지가 이 질문입니다.",
+    "그림자를 1초 간격으로 여러 번 보여 주면 초파리는 그 횟수만큼 더 빨리 뛰어다니고, 그 상태가 수십 초 이어집니다(Gibson 등 2015). "
+    "다가오는 그림자에는 천천히 걷던 파리의 77%, 빨리 걷던 파리의 27%가 얼어붙었습니다(Zacarias 등 2018).",
+    flies=10, also=("freeze_s", "still_pct"),
+    outcomes=(
+        ("A>B", "그림자가 지나가는 A가 더 빨리 걸을 것이다"),
+        ("A<B", "그림자가 없는 B가 더 빨리 걸을 것이다"),
+    ),
+))
+
 #: The page's grouping of the sets, in order.
 SET_GROUPS: list[tuple[str, list[str]]] = []
 for _set in EXPERIMENT_SETS.values():
-    if not SET_GROUPS or SET_GROUPS[-1][0] != _set.group:
-        SET_GROUPS.append((_set.group, []))
-    SET_GROUPS[-1][1].append(_set.key)
+    # One heading per group, in order of first appearance, wherever a set was added.
+    group = next((g for g in SET_GROUPS if g[0] == _set.group), None)
+    if group is None:
+        group = (_set.group, [])
+        SET_GROUPS.append(group)
+    group[1].append(_set.key)
 
 
 def protocol_for(key: str, *, flies: int | None = None, seconds: float | None = None,

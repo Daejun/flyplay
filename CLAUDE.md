@@ -61,10 +61,10 @@ anything else.
 .venv\Scripts\python.exe scripts\13_mb_check.py
 ```
 
-The mushroom-body counterpart: 29 pass/fail checks (16 smell, 13 vision), pure
-numpy, seconds. **Run it after touching `flyplay/olfactory.py`,
-`flyplay/visual_pathway.py`, `flyplay/mushroom_body.py`, or the omission feedback
-in `flyplay/conditioning.py`.** The behavioural experiments are
+The mushroom-body counterpart: 38 pass/fail checks (16 smell, 13 vision, 9 on
+the sandbox's connectome front end), pure numpy, seconds. **Run it after touching
+`flyplay/olfactory.py`, `flyplay/visual_pathway.py`, `flyplay/mushroom_body.py`,
+`flyplay/data/`, or the omission feedback in `flyplay/conditioning.py`.** The behavioural experiments are
 `14_run_conditioning.py --experiment compartments|extinction` (~8 min each on 16
 cores) and `--experiment colour|brightness --seeds 10` (~2 h each: eyes rendered
 in every fly), each with its own output dir, then `15_analyze_mb.py --dir <that
@@ -94,6 +94,23 @@ replay files for the first flies, and at the end `trials.csv` and a Korean
 inquiry report (`report.html`). The viewer's A/B lab starts the same script
 with `--dir` and reads the same directory. Runs are the user's to start: they
 fill the viewer's experiment list and take all but two cores.
+
+```bash
+.venv\Scripts\python.exe scripts\18_build_brain_data.py --download
+```
+
+Fetches DoOR's receptor responses and the hemibrain connectome into `data/raw/`
+(git-ignored, 46 MB) and rebuilds the small tables in `flyplay/data/` that the
+sandbox's olfactory front end reads. The tables are committed, so this is only
+for changing what is extracted. `19_eye_azimuths.py` re-measures, by rendering,
+which way each ommatidium looks (`flyplay/data/ommatidia_azimuth.npz`, read by
+the central complex). The tables keep their sources' licences
+(`flyplay/data/SOURCES.md`; DoOR's is CC BY-SA).
+
+The sandbox viewer keeps its fly across restarts in a *session*,
+`out/sandbox/sessions/<name>/` (`--session`, default `main`; `--fresh` starts a
+new fly and sets the old state aside). A second viewer on the same session is
+refused, so a test viewer on another port needs `--session <other name>`.
 
 See [STATUS.md](STATUS.md) for what is currently trained and how to pick it up.
 
@@ -175,8 +192,12 @@ pillar in view pushes the horizon above it and obstacles read as zero forever.
 `FastTurningController` (FlyGym's hybrid turning controller with its output
 order, phase-gain breakpoints and correction vectors built once),
 `ContactForces` (FlyGym's `get_bodysegment_contact_forces` with its lookups
-built once), and `Walker.advance`, which steps physics as one `mj_step(nstep)`
-call between controller updates. Same arithmetic, same order: checked against
+built once), `Walker.advance`, which steps physics as one `mj_step(nstep)`
+call between controller updates, and one `PPoly` call for all six legs'
+splines with the rest of the per-leg work in Python floats (88.7 us a call to
+51.3; checked against the version it replaced over 5000 observations recorded
+from a real run, joint angles, adhesion, both correction arrays and the CPG
+phases equal on every one). Same arithmetic, same order: checked against
 the stock pipeline (`from_sim`, `HybridTurningController`,
 `apply_locomotion_action`, single `sim.step`s) over 6000 updates in a walled
 room with stops and turns -- 0 mismatches in observations, ctrl, qpos, qvel and
@@ -187,6 +208,24 @@ that comparison before trusting any result.
 **Descending signal lives in [0.4, 1.6].** Below ~0.3 a tripod stalls, the fly
 pivots about the stalled side, and **the turn direction flips**. `SIGNAL_LOW` /
 `SIGNAL_HIGH` in `env.py` encode this; do not widen them.
+
+**The eyes' readout is one gather, not a fisheye pass and a pooling pass.**
+`flyplay/retina_fast.py`, reached through `FlySim.ommatidia_readouts`, which
+every caller in flyplay uses in place of `Simulation.get_ommatidia_readouts`.
+FlyGym recomputes the same 512x450 coordinate transform on every call and
+writes a whole image that the pooling immediately reads back; which source
+pixel lands in which destination pixel is fixed by the retina, so the readout
+is one accumulation. Both eyes with the render: 5.81 ms against 1.75 on a
+pinned core. It is bit-identical, not merely close -- the fisheye copies
+pixels rather than blending them, destination pixels whose source falls off
+the image add `0 / hex_pxl_size` either way, and the additions happen in the
+same ascending order (FlyGym's `prange` there is `parallel=False`) -- and
+`EyeReadout` checks itself against FlyGym's own two passes when it is built,
+raising rather than drifting after an upgrade. Checked again on 120 real
+renders: every frame equal. What it is worth depends on how often the eyes are
+read -- 10 s a room, fingerprints identical: `scented_sugar` 811 -> 775 ms of
+wall time per simulated second at 10 Hz, `shadow_sugar` 1756 -> 1133 and
+`drum_turning` 1998 -> 1176 at 100 Hz.
 
 **Vision costs 25 ms per query** against 0.106 ms for a physics step. Hence
 `vision_hz` decoupled from `action_hz` (20 Hz vs 100 Hz, last features held in
@@ -285,6 +324,15 @@ which colour the fly stands on comes from `colour_at` (the pattern), never from
 geom positions. Repainting uses `mj_model.geom_rgba`, which reaches the eyes on
 the next render without a rebuild.
 
+**The visual front end answers from its last call while the eyes have not
+changed.** In a 10 Hz room `Sandbox.step` hands the same readouts to
+`MushroomBody.step` for nine more physics steps, so the pooling and the top-k
+ran a hundred times a second on one picture: 13.5 ms of each simulated second
+down to 1.9, fingerprint unchanged. `VisualFrontEnd.__call__` compares the
+readouts by value, not by identity, so writing into a readouts array in place
+still gives a fresh answer; a room where something moves reads new eyes every
+step and never hits.
+
 **Colour steering is the bilateral comparison alone.** Ceiling test with a
 hand-set memory: bilateral gain 3 gave LI -0.56; adding kinesis dropped it to
 -0.32 because walking faster eats turning authority. Numbers in
@@ -328,6 +376,29 @@ escapes in ~0.2 s; seven such shocks left blue at -0.10, too faint to steer by.
 its bout-start value while being fed on). With a fixed 2.5 mm, 20, 100 and
 500 nl drops gave step-for-step identical runs.
 
+**Only the solids near the fly keep their bounding spheres.** The room's
+walls are 104 mm long, so their spheres cover the whole floor and every leg is
+tested against every wall on every step -- collision detection was 313.5 ms of
+each simulated second, about two thirds of it walls. `Room.gate_bounds`, called
+from `Sandbox.step` with the thorax position just before the physics, leaves a
+real `geom_rbound` only on the walls and obstacles whose footprint is within
+`GATE_MM` (8 mm) and shrinks the rest to **1e-6 -- not 0, which MuJoCo reads as
+"this geom is a plane" and stops filtering**. 8 mm is the margin: the fly
+reaches 3.0 mm from thorax to tarsus tip and moves under 0.3 mm in the 10 ms
+between calls. **Anything that steps physics outside `Sandbox.step` must call
+`Room.ungate` first.** `_settle_body` does, which covers `reset_fly`,
+`return_home`, `move_fly`, `rest` and `restore`; without it a fly set down
+beside a wall whose sphere is still 1e-6 walks through it without one contact.
+Measured over 10 s a room, two seeds, gate and visual cache off against on,
+every `qpos` and readout fingerprint identical: `t_maze` 1283/1235 -> 949/931
+ms of wall time per simulated second, `scented_sugar` 979/991 -> 784/758,
+`obstacle_field` 1022/1031 -> 811/823, `corridor` 1086/1079 -> 953/924, and -6
+to -14% in `dead_end_maze`, `heat_maze`, `drum_turning` and `shadow_sugar`.
+With the proximity reflex off and the fly driven into a wall, a block and
+another wall -- 798 of 1400 steps in contact, 338 of them upside down --
+`qpos` was identical at every step, with 19.2 of the 20 solids gated off on
+average.
+
 **Obstacles are resizable boxes, so their bounds must follow.** A wall is an
 obstacle with long `hx`/`hy`; `Room._apply_params` rewrites `geom_size` *and*
 `geom_rbound`/`geom_aabb`. Measured with a 40 mm wall hit 15 mm off centre: with
@@ -345,8 +416,152 @@ and it never waits again.
 planted feet and flickers as legs step; a new shock counts only after 1 s off
 every zone (`shock_rearm_seconds`).
 
-**Odour passes through obstacles** (inverse-square field). Behind a block the
-gradient points into it; the reflex and saccades get the fly round the end.
+**Odour goes round obstacles, by path length** (`WalledOdorField`). Intensity is
+still NeuroMechFly's inverse square, of the shortest path round the solids
+(corners of the obstacle rectangles as graph nodes) rather than the straight
+line. Where a source is in plain view the reading is bit-identical to the
+straight field, so every open-room calibration stands (sandbox fingerprint
+unchanged in scented_sugar and blue_shock). Measured, six flies per room, first
+feed within 90 s: dead_end_maze 4/6 found (median 40 s) with odour through walls
+against 6/6 (16.6 s) round them; wall_between, two_rooms, room_in_room and t_maze
+about the same either way. A read costs 65-232 us (16 obstacles, 64 corners).
+It is geometry, not diffusion: PLAN.md B-1's grid solution would change the
+field in the open room too. A sealed box reads zero outside.
+
+**The sandbox fly survives a restart; its synapses only onto the same wiring.**
+`flyplay.session` writes the fly (every synapse, hunger, both clocks, room with
+what is left of each drop, tallies, event log, central complex, random state)
+every 30 s and on a clean exit, renames the state file into place, and appends
+the trail instead of rewriting it (a day of trail is 6.9 MB). The session is
+locked by an OS file lock, released however the viewer dies. State carries
+`MushroomBody.wiring_signature()` -- a hash of every fixed matrix between the
+senses and the synapses and the compartments' cell masks -- and a mismatch sets
+the old state aside and starts a new fly: weights on other wiring would sit on
+the wrong cells without an error. Killed with Stop-Process and restarted, a
+viewer came back with the same room, drop contents, hunger, clock, values,
+trail and results row.
+
+### The sandbox's brain (`flyplay/olfactory.py` `ConnectomeFrontEnd`, `flyplay/sandbox.py`)
+
+**Every addition is a `SandboxConfig` switch, and all of them off is the old
+fly exactly.** `brain="random"`, `individuality=False`, `wall_following=False`,
+`search_radius_start=12`, `central_complex=False`, `labellum_contact=False`
+reproduces the sandbox fingerprint (scratch `fingerprint.py`, three presets, 600
+steps) of the model before these changes, bit for bit; checked after each one.
+Keep that true: it is how a change is shown to touch only what it claims to.
+
+**Receptors are DoOR's, claws the hemibrain's.** A glomerulus responds to an
+odorant as DoOR's consensus for its receptor (SFR subtracted, inhibition
+clipped, unmeasured = 0); the room's vinegar is a blend (acetic acid 1, ethyl
+acetate 0.5, acetoin 0.5 -- DM1 and VA2 need driving, Semmelhack & Wang 2009;
+the proportions are a model choice). 3-octanol's Or13a response is left out as a
+contaminant (Lüdke et al. 2025). The 1733 olfactory Kenyon cells keep their
+hemibrain types and lobes; `wiring="sampled"` (default) redraws each cell's
+glomeruli from its type's preferences with the cell's own claw count and synapse
+counts, per seed, so flies differ as real ones do and twins share wiring.
+
+**APL inhibits each lobe on its own.** One global APL gave gamma cells (7 claws,
+averaging more glomeruli) 13-23% of the code for 35% of the cells, and the
+gamma1pedc compartment a third of its learning. Per lobe (Amin et al. 2020:
+APL acts locally), feedback strength 52 puts the median odour at 7.2% of each
+lobe's cells (range 2.4-11.8%), each lobe carries exactly its share of the code,
+and blocking APL (0.2) gives 3.1x the active cells with similar mixtures more
+alike -- Lin et al. (2014)'s result. `13_mb_check.py` section 9 checks all of it.
+
+**Compartments read their own lobes, rescaled.** gamma1pedc (approach_fast)
+reads gamma cells, alpha3 (approach_slow) alpha/beta, beta'2+gamma4 (avoid_sweet)
+alpha'/beta' and gamma, gamma5+alpha1 (avoid_nutrient) gamma and alpha/beta;
+input is divided by the lobes' share (`Compartment.coverage`) so a novel odour
+still reads `w0`, and `eta` is scaled by the cells a compartment reads over the
+100 of the old code, so one pairing depresses about as far as before: one shock
+pulse 0.30 against 0.22, five seconds of sucrose 0.56/0.29 against 0.53/0.27.
+
+**Octanol and MCH now overlap, because their receptors do.** Both drive Or69a
+(glomerulus D) hardest; receptor profiles cosine 0.47, Kenyon-cell codes 0.33
+(0.16-0.46 over 8 flies) against 0.05 on random wiring. Learning generalises:
+sucrose with octanol raised MCH to 45% of octanol's value (10% before). In the
+room, condition A of sugar_odour gave test PI +0.90 (4 flies; +0.97 random) with
+MCH at +0.50 (+0.04), and shock_odour +0.02 (+0.05). Vinegar stays apart from
+both (cosine under 0.05). The conditioning tasks keep `OlfactoryFrontEnd`.
+
+**Visual Kenyon cells are the hemibrain's 99 gamma-d and 60 alpha/beta-p** (159,
+was 100), lobes attached. The dark room floor still shares no cell with blue or
+green on 16 seeds.
+
+**Motion vision runs only while something moves by itself** (`flyplay/
+motion_vision.py`: Hassenstein-Reichardt correlators on ON and OFF signals,
+Borst 2018's 250/50 ms filters). A turning drum or a shadow item switches the
+eyes to 100 Hz; a still drum (a panorama) and every other room keep 10 Hz and no
+motion output, as if an efference copy cancelled the fly's own flow -- at 100 Hz
+every experiment would slow. The drum and the shadow are mocap bodies parked
+under the floor plane: placing nothing, the fingerprint is unchanged (checked,
+eye-dependent blue_shock included). `ROTATION_SIGNS` and the thresholds come
+from rendered eyes with the fly held still (numbers in the module): a
+counterclockwise drum gives negative image-column motion in both eyes, walking
+forward opposite signs that cancel. The shadow detector reads net dimming, OFF
+minus ON, over the upper field: with OFF alone the drum's stripes, which fill
+that field beside a wall, read as shadows and froze flies (2-9 mm/s beside a
+turning drum against 13-16 beside a still one).
+
+**The central complex loses its bearings whenever the fly is put down.**
+`CentralComplex.put_down` (every `reset_fly`, `return_home`, `move_fly`, `rest`
+and restore) gives the compass a random heading and zeroes the integrator; only
+a learned landmark bearing re-anchors it to a panorama. That is what makes a
+place remembered in one trial findable in the next with landmarks and not
+without, as in Ofstad et al. (2011) -- do not "fix" it by starting the compass at
+the true heading. Ring input is where the panorama's dark features are
+(`landmark_view`: ommatidia reading under 0.3 in the upper half of the field,
+their mean bearing and how clear it is), with azimuths from
+`flyplay/data/ommatidia_azimuth.npz` (rendered one drum stripe at a time: left
+eye -12 to +135 degrees, right -135 to +14, about 180 ommatidia each). Three
+richer forms failed first (module docstring): Hebbian ring-to-wedge weights
+swung the estimate 100-200 degrees within seconds, a whole-panorama template
+re-anchored three put-downs in six because walls fill the view near them, and
+counting the grey walls as dark made the nearest wall the landmark. The place
+memory it gives is weak: over 8 trials of 45 s, 4 flies, the landmark flies
+reached the cool spot in 14.3 s in the last two trials against 27.5 s without
+(every pair), but were already faster in the first two (25.4 s against 34.1 s);
+a stronger pull (`VISUAL_GAIN` 1.0) made them slower, 39.2 s. `place_memory`
+has not been piloted. Local
+search now returns to where the integrator says the meal was, errors included.
+A goal is set on relief -- cool floor after a second on hot -- and steered toward
+only while the floor is hot. `Sandbox.cx_view` puts the believed goal and meal
+on the map (star and cross).
+
+**Heat, light and bitterness are dopamine and reflexes, not scenery.** A heat
+zone (hidden, like shock plates) punishes above 30 C (`heat_drive`, half at 34),
+turns the fly back when the antennae are 3 C warmer than the floor under it, and
+speeds it up on hot floor; rectangles (`hx`/`hy`) tile a floor round a cool
+spot. A light zone writes punishment or reward dopamine directly, with no sense
+and no hunger gate (CsChrimson). Bitter scales a drop's sweetness by 1 - bitter,
+punishes while tasted, and stops a fly starting a meal when little sweetness is
+left. Drinking needs the labellum (the haustellum geom's centre) over the drop;
+a fly whose labellum misses folds, creeps toward the middle and extends again.
+
+**Individual flies differ, from their own generator.** `Individual.draw` uses
+`default_rng([seed, 7907])`, leaving the behaviour stream alone, so twins in an
+A/B set are the same individual: left/right saccade bias Beta(4.2, 4.2) (24.0%
+of flies beyond 70/30, Buchanan et al. 2015: 23.5%), walking drive and wall
+affinity with a log s.d. of 0.1 and 0.3 (model choices). Wall following holds a
+wall alongside at 4.5 mm -- where the reflex's 25-degree ray no longer reaches
+it -- and halves saccades along it.
+
+**What the new behaviours measured** (4 flies per arm, same seeds, 14 pinned
+workers; scratch `behaviour_calibrate.py`): time in the room's outer third
+0.89 with wall following against 0.72 without, over 120 s (real flies 0.90-0.95,
+Soibam 2012; gain 0.15 without the saccade halving gave only 0.82). Shadow
+bursts (five passes a second apart, every 10 s) raised walking speed to 16.1
+mm/s from 14.1 with 2-8 s of freezing in 60 s, Gibson et al. (2015)'s direction;
+before freezing needed 5 quiet seconds, freezes chained through each burst and
+flies slowed to 9 mm/s. Bitter sugar (0.6) was fed on 9.0 s against 12.8 and
+left vinegar at -0.22 against +0.75. Three minutes with octanol under a
+punishing light left octanol at -0.13 to -0.23 and MCH at -0.02 to -0.13.
+A drum turning counterclockwise at 60 deg/s turned all four flies with it at
++17 to +21 deg/s with `optomotor_gain` 1.0 (their still-drum twins -20 to +19,
+circling the walls either way); at 0.3 two of the four kept circling clockwise.
+The shadow numbers above were measured at 0.3. Drinking needs the labellum
+(`labellum_contact`, on in all of these runs: the bitter test's plain sugar was
+fed on for 8.9-16.8 s); on against off was not measured.
 
 **The fly's eyes see its own legs, so colour goes on the viewer's copy only.**
 Built with `colorize=True`, 350 of 1442 ommatidia changed, VPN outputs by up to
@@ -415,6 +630,11 @@ first), which split a five-step drag into five records. Test scripts use
 `_start_trial`/`_finish_trial` were silently replaced by the conditioning
 methods of the same name defined later in the class (TypeError on the first
 trial). Sandbox-only names carry `_sb_`.
+
+**Header values hold still.** The sandbox header has no odour / nearest-sugar /
+wall-contact line (the server does not compute those fields there): its values
+changed length on every poll, re-wrapped the header and shook the layout under
+it. The remaining values have fixed `min-width`s for the same reason.
 
 **The video keeps 240 px, and the card under it shrinks.** The A/B pane first
 took 393 of the column's 440 px at 1366x768 and left the video 39 px. The card
@@ -516,6 +736,23 @@ Beyond that the report calls a hypothesis supported when the mean difference
 exceeds the measure's `tolerance` and 70% of pairs agree -- wording for a
 middle-school report, printed beside the sign test's probability.
 
+**The verdict says how big, and how many flies would make it believable.**
+`paired_effect` is d_z (mean pair difference over its s.d., capped at 99 so the
+payload stays JSON); `pairs_needed` is the fewest pairs for which the sign test
+would come out under 5% in 8 of 10 reruns, taking this run's share of agreeing
+pairs pulled toward a coin flip ((agree+1)/(n+2)) and its tie rate. 3 of 3
+agreeing need 20 pairs, 8 of 8 need 12, 6 of 8 need 49.
+
+**A set must ask something the model does not already state.** "영양 없는 단맛도
+배를 채울까?" was removed: hunger falls only with calories by construction, so
+the answer was written before the run (the user's call). Runs of a removed set
+still list and report; they cannot be run again.
+
+**The lab's time estimates use the newest runs' own speed**: the median over the
+last three finished runs of simulated seconds over trial wall time. One constant
+went stale twice in an evening, and one run slowed by other work read 0.26x
+against 0.41-0.46x for its neighbours.
+
 **A set is only as good as its design.** Each set's conditions must actually let
 the fly meet the stimulus (sugar that is found, a shock zone that is walked
 onto) or both arms read the same: a lone odourless drop was never found in 60 s
@@ -523,6 +760,18 @@ by either arm, and vinegar sugar was found in 3 s from the first trial, leaving
 nothing to learn. Which sets were piloted, and which were redesigned afterwards
 without a pilot, is in PLAN.md E. **The user starts experiments**: do not run
 pilots or sweeps on your own -- offer the command.
+
+**Experiment workers must be pinned to cores** (PERFORMANCE_PLAN.md X1). A
+thread holding an OpenGL context on the RTX is kept on the 4 P cores by
+Windows, however busy they are, so 14 workers shared 4 cores. Each worker given
+its own core with `psutil.Process().cpu_affinity` (P 1-3, E 4-11, LP-E 12-14)
+ran the same 120 s wall-following flies in 199-309 s of wall time against
+409-426 s unpinned, with identical results. `17_run_experiment.py` pins them
+(`pin_worker`, one core each counting up from 1 so core 0 is left to the viewer
+and the desktop, no pinning at all when there are not enough cores to go
+round), and gives the workers `NUMBA_NUM_THREADS=1` because a pinned worker's
+16 OpenMP threads would share its one core. `--no-pin` turns it off, which is
+how the two are compared.
 
 **The GPU does not win at this scale.** Measured here: MuJoCo-Warp on the RTX
 5060 walks 4096 flies at 12.8x real time in total *for the physics alone*,
@@ -559,6 +808,9 @@ readouts -- the CPU methods read `mj_data`, which GPU stepping never updates.
   code differing in 1 of 5 cells. `10_sense_check.py` passes on both, but the
   fingerprint changes; runs started before 2026-09-17 21:48 rendered on Intel.
   `SHIM_MCCOMPAT=0x800000000` renders on Intel again.
+- **Git Bash `sed -i` rewrote a CRLF file with LF endings** (flyplay/room.py,
+  every line a diff). Edit through a script that keeps the file's endings, or
+  check `file <path>` afterwards.
 - **Console output must be ASCII.** The console is cp949; an em dash in a
   `print` raises `UnicodeEncodeError` and kills the process. Korean text in
   `.md` files is fine — this applies to stdout only.

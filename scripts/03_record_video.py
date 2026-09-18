@@ -30,7 +30,7 @@ def eye_view(fs) -> np.ndarray:
     retina's `hex_pxls_to_human_readable` lays those hexagons back out on a
     grid so they can be watched as video.
     """
-    readouts = fs.sim.get_ommatidia_readouts(fs.name)
+    readouts = fs.ommatidia_readouts()
     panels = [
         fs.sim.retina.hex_pxls_to_human_readable(eye.max(axis=1), color_8bit=True)
         for eye in readouts

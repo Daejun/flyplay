@@ -37,6 +37,7 @@ import numpy as np
 
 from flyplay.experiment import (
     EXPERIMENT_SETS,
+    PAIRS_NEEDED_CAP,
     PHASE_LABELS,
     ROLE_LABELS,
     VERDICT_TEXT,
@@ -270,7 +271,21 @@ def svg_room(items: list[dict], path: list | None = None, size: int = 210, colou
     Y = lambda y: (50.0 - y) * s
     out = [f'<svg viewBox="0 0 {size} {size}" class="room" role="img">',
            f'<rect x="0" y="0" width="{size}" height="{size}" fill="#f7f7f5" stroke="#888"/>']
-    for kind in ("patch", "overlay", "shock", "odour", "sugar", "obstacle"):
+    for it in items:
+        p = it.get("params", {})
+        if it["kind"] == "drum":
+            # Stripes round the edge, and which way they turn.
+            dash = "4 4" if p.get("pattern", "stripes") == "stripes" else "10 18"
+            out.append(f'<circle cx="{X(0):.1f}" cy="{Y(0):.1f}" r="{48 * s:.1f}" fill="none" stroke="#333" '
+                       f'stroke-width="{2.5 * s:.1f}" stroke-dasharray="{dash}"/>')
+            speed = float(p.get("speed", 0.0))
+            arrow = "멈춤" if speed == 0 else ("↺ " if speed > 0 else "↻ ") + f"{abs(speed):.0f}°/s"
+            out.append(f'<text x="{X(0):.1f}" y="{Y(-38):.1f}" font-size="{7 * s:.1f}" text-anchor="middle" fill="#333">{arrow}</text>')
+        elif it["kind"] == "shadow":
+            out.append(f'<rect x="{X(-6):.1f}" y="0" width="{12 * s:.1f}" height="{size}" fill="#111" fill-opacity="0.18"/>')
+            out.append(f'<text x="{X(0):.1f}" y="{Y(40):.1f}" font-size="{7 * s:.1f}" text-anchor="middle" fill="#111">'
+                       f'그림자 {float(p.get("interval", 10.0)):.0f}초마다 {int(p.get("passes", 1))}번</text>')
+    for kind in ("heat", "patch", "overlay", "light", "shock", "odour", "sugar", "obstacle"):
         if kind == "overlay":
             out.append(overlay)
             continue
@@ -282,6 +297,13 @@ def svg_room(items: list[dict], path: list | None = None, size: int = 210, colou
                 h = p.get("half", 12.0)
                 fill = "#4d7fe0" if p.get("colour") == "blue" else "#4fb05a"
                 out.append(f'<rect x="{X(x - h):.1f}" y="{Y(y + h):.1f}" width="{2 * h * s:.1f}" height="{2 * h * s:.1f}" fill="{fill}" fill-opacity="0.55"/>')
+            elif kind == "heat":
+                hx, hy = p.get("hx", p.get("half", 12.0)), p.get("hy", p.get("half", 12.0))
+                out.append(f'<rect x="{X(x - hx):.1f}" y="{Y(y + hy):.1f}" width="{2 * hx * s:.1f}" height="{2 * hy * s:.1f}" fill="#ff7a28" fill-opacity="0.28"/>')
+            elif kind == "light":
+                h = p.get("half", 12.0)
+                col = "#3aa33a" if p.get("target") == "reward" else "#9b3fd1"
+                out.append(f'<rect x="{X(x - h):.1f}" y="{Y(y + h):.1f}" width="{2 * h * s:.1f}" height="{2 * h * s:.1f}" fill="none" stroke="{col}" stroke-width="1.5" stroke-dasharray="2 3"/>')
             elif kind == "shock":
                 h = p.get("half", 12.0)
                 dash = "" if p.get("volts", 60.0) > 0 else ' stroke-opacity="0.35"'
@@ -394,20 +416,51 @@ def _verdict_block(s, protocol: Protocol, result: dict) -> str:
         f'<p>같은 번호의 A·B 파리는 뇌 배선과 출발 방향이 같은 쌍둥이입니다. {agree}. '
         f'A와 B가 사실 똑같다면, 동전을 {result["a_higher"] + result["a_lower"]}번 던져 이만큼 한쪽으로 몰릴 확률은 '
         f'약 {coin * 100:.0f}%입니다(작을수록 우연이 아닐 가능성이 큽니다).{caution}</p>'
+        f'{_size_words(protocol, result)}'
         f'<p class="small">판정 기준: 평균 차이가 {result["tolerance"]:g}보다 크고, 쌍의 70% 이상이 같은 방향일 때 '
         f'"맞았다"고 적었습니다. 학생 수준에 맞춰 정한 기준이지 통계 검정이 아닙니다.</p></div>'
     )
 
 
-def _limitations(protocol: Protocol, records: list[dict]) -> list[str]:
+def _size_words(protocol: Protocol, result: dict) -> str:
+    """How big the difference is, and the flies a believable result needs."""
+    if result.get("effect") is None:
+        return ""
+    ratio = abs(result["effect"])
+    size = (f'<p>차이의 크기: <b>{esc(result["effect_words"])}</b> (쌍마다 난 차이의 평균이, 그 차이가 쌍마다 '
+            f'흔들리는 폭의 {"99배 넘게" if ratio >= 99 else f"{ratio:.1f}배"}입니다). ')
+    needed = result.get("pairs_needed")
+    if result["direction"] == "same":
+        size += "차이가 허용 범위 안이라 파리를 늘려도 '다르다'고 말하기 어렵습니다."
+    elif needed is None:
+        size += (f"쌍마다 방향이 엇갈려서 조건마다 파리를 {PAIRS_NEEDED_CAP}마리 넘게 써도 확실해지기 "
+                 "어렵습니다.")
+    elif needed <= protocol.flies:
+        size += f"이 차이는 지금 파리 수(조건마다 {protocol.flies}마리)로 충분히 보입니다."
+    else:
+        size += (f"이 차이를 확실히 보이려면 조건마다 파리가 약 <b>{needed}마리</b> 필요합니다"
+                 f"(지금 {protocol.flies}마리).")
+    return size + ('</p><p class="small">"확실히"는 같은 실험을 10번 되풀이하면 8번은 동전 던지기 확률이 5%보다 '
+                   '작게 나온다는 뜻입니다. 지금 결과의 쌍 방향 비율을 조금 보수적으로 잡아 계산했습니다.</p>')
+
+
+def _limitations(protocol: Protocol, records: list[dict], result: dict | None = None) -> list[str]:
+    needed = (result or {}).get("pairs_needed")
+    if needed is not None and needed > protocol.flies:
+        flies = (f"파리 수가 조건마다 {protocol.flies}마리입니다. 지금 나온 차이를 확실히 보이려면 약 {needed}마리가 "
+                 "필요합니다(5. 결과).")
+    else:
+        flies = f"파리 수가 조건마다 {protocol.flies}마리입니다. 실제 실험은 보통 한 번에 수십~백여 마리를 씁니다."
     out = [
         "실제 초파리가 아니라 시뮬레이션입니다. 몸과 다리는 실제 초파리를 본떴지만 뇌는 버섯체 학습과 몇 가지 "
         "타고난 반응 규칙만 있는 단순한 모델입니다.",
-        f"파리 수가 조건마다 {protocol.flies}마리입니다. 실제 실험은 보통 한 번에 수십~백여 마리를 씁니다.",
+        flies,
         "배고픔은 보기 좋게 빨리 변하도록 압축했습니다(0에서 1까지 30분). 쉬는 시간은 시뮬레이션하지 않고 "
         "기억이 줄어드는 계산만 합니다.",
-        "냄새는 벽을 통과해 퍼지고, 설탕 방울은 보이도록 실제보다 훨씬 크게 그렸습니다.",
-        "장소를 기억하는 뇌 영역(중심복합체)은 없습니다. 냄새와 바닥 색의 좋고 싫음만 배웁니다.",
+        "냄새는 벽을 돌아가는 가장 짧은 길의 길이로 세기를 계산합니다. 실제 공기의 흐름이나 퍼지는 데 "
+        "걸리는 시간은 없고, 설탕 방울은 보이도록 실제보다 훨씬 크게 그렸습니다.",
+        "버섯체는 냄새와 바닥 색의 좋고 싫음을 배우고, 중심복합체는 뜨거운 바닥에서 찾은 시원한 곳만 목표로 기억합니다. "
+        "전기 구역이나 설탕의 자리를 장소로 기억하지는 않습니다.",
     ]
     stopped = sum(r["stopped"] for r in records)
     if stopped:
@@ -592,6 +645,7 @@ def build_report(directory: Path) -> str:
 
     # 5. results
     add('<h2>5. 결과</h2>')
+    result = None
     if not records:
         add('<p>아직 끝난 시행이 없습니다.</p>')
     elif s:
@@ -638,7 +692,7 @@ def build_report(directory: Path) -> str:
 
     # 7. limits
     add('<h2>7. 한계와 오차</h2><ul>')
-    for line in _limitations(protocol, records):
+    for line in _limitations(protocol, records, result):
         add(f'<li>{esc(line)}</li>')
     add('</ul>')
     add(_write_box("limits", "내가 생각한 오차나 아쉬운 점, 다음에 바꿔 보고 싶은 것", 2))

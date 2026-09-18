@@ -20,10 +20,18 @@ with ``f(d) = d**-2`` by default. The odour space is deliberately separate from
 the source list: three physical sources can span a two-dimensional
 (attractive, aversive) space, which is how the NeuroMechFly papers set up
 approach-avoidance tasks.
+
+**Walls.** `OdorField` measures `d` in a straight line, so odour passes through
+anything in between. `WalledOdorField` measures it along the shortest path that
+goes round the room's solids instead (see there): the same field wherever a
+source is in plain view of the sensor, weaker behind a wall, and pointing round
+the wall's end rather than into it.
 """
 
 from __future__ import annotations
 
+import heapq
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import mujoco as mj
@@ -222,3 +230,204 @@ class OdorField:
         lr = cls.left_right(intensities)
         mean = lr.mean(axis=0)
         return (lr[0] - lr[1]) / np.maximum(mean, eps)
+
+
+# --- odour round walls ---------------------------------------------------------------
+
+#: Added to every solid's half-extents when testing whether a straight line is
+#: blocked, mm. Two walls drawn edge to edge leave a gap of zero width that a
+#: line could slip through; grown by this much they overlap.
+SOLID_MARGIN = 0.05
+#: How far outside a solid's corner, diagonally, a path turns round it, mm.
+#: Beyond `SOLID_MARGIN`, so a path along a wall's face does not touch it.
+CORNER_CLEARANCE = 0.15
+
+
+def _blocked(starts: np.ndarray, ends: np.ndarray, rects: np.ndarray) -> np.ndarray:
+    """Whether each segment ``starts[i] -> ends[i]`` crosses the inside of any rect.
+
+    Args:
+        starts, ends: ``(..., 2)`` segment end points, broadcast against each other.
+        rects: ``(n, 4)`` rows of centre x, centre y, half x, half y.
+
+    Returns:
+        Boolean array of the broadcast leading shape. A rect holding either end
+        of a segment does not block it: a source placed on top of a block smells
+        from the block, and a sensor pressed against a wall is still in the room.
+    """
+    p = np.asarray(starts, dtype=float)[..., None, :]
+    q = np.asarray(ends, dtype=float)[..., None, :]
+    centre, half = rects[:, :2], rects[:, 2:]
+    d = q - p
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ta = (centre - half - p) / d
+        tb = (centre + half - p) / d
+    # A segment parallel to an axis is inside that slab everywhere or nowhere.
+    parallel = np.abs(d) < 1e-12
+    inside_slab = np.abs(p - centre) < half
+    t_near = np.where(parallel, np.where(inside_slab, -np.inf, np.inf), np.minimum(ta, tb))
+    t_far = np.where(parallel, np.where(inside_slab, np.inf, -np.inf), np.maximum(ta, tb))
+    enter = np.maximum(t_near.max(axis=-1), 0.0)
+    leave = np.minimum(t_far.min(axis=-1), 1.0)
+    holds = (np.all(np.abs(p - centre) < half, axis=-1) | np.all(np.abs(q - centre) < half, axis=-1))
+    return np.any((enter < leave) & ~holds, axis=-1)
+
+
+class PathGraph:
+    """Shortest paths round axis-aligned rectangles in the floor plane.
+
+    A shortest path between two points past convex obstacles bends only at
+    obstacle corners, so the corners (moved `CORNER_CLEARANCE` outward) are the
+    graph's nodes and a straight line that crosses no rectangle is an edge.
+    Built once per layout; `lengths` then answers for any points.
+
+    Args:
+        rects: ``(n, 4)`` centre x, centre y, half x, half y of every solid.
+        half: The room's interior half-width. Corners outside it, where an
+            obstacle meets the room's own wall, are not ways round.
+    """
+
+    def __init__(self, rects: np.ndarray, half: float):
+        base = np.asarray(rects, dtype=float).reshape(-1, 4)
+        self.rects = base + np.array([0.0, 0.0, SOLID_MARGIN, SOLID_MARGIN])
+        signs = np.array([(-1, -1), (-1, 1), (1, -1), (1, 1)], dtype=float)
+        corners = (base[:, None, :2] + signs[None] * (base[:, None, 2:] + CORNER_CLEARANCE)).reshape(-1, 2)
+        inside_any = np.any(np.all(np.abs(corners[:, None, :] - self.rects[None, :, :2])
+                                   < self.rects[None, :, 2:], axis=-1), axis=1) if len(base) else np.zeros(0, bool)
+        in_room = np.all(np.abs(corners) < half, axis=1)
+        self.nodes = corners[in_room & ~inside_any]
+        n = len(self.nodes)
+        # Node-to-node edges.
+        self.edges = np.full((n, n), np.inf)
+        if n:
+            free = ~_blocked(self.nodes[:, None, :], self.nodes[None, :, :], self.rects)
+            length = np.linalg.norm(self.nodes[:, None, :] - self.nodes[None, :, :], axis=-1)
+            self.edges = np.where(free, length, np.inf)
+        self._from_source: dict[tuple[float, float], np.ndarray] = {}
+
+    def distances_from(self, source: np.ndarray) -> np.ndarray:
+        """Shortest path length from `source` to every node (inf if walled off)."""
+        key = (float(source[0]), float(source[1]))
+        cached = self._from_source.get(key)
+        if cached is not None:
+            return cached
+        n = len(self.nodes)
+        dist = np.full(n, np.inf)
+        if n:
+            free = ~_blocked(np.broadcast_to(source, (n, 2)), self.nodes, self.rects)
+            dist[free] = np.linalg.norm(self.nodes[free] - source, axis=1)
+            heap = [(d, i) for i, d in enumerate(dist) if np.isfinite(d)]
+            heapq.heapify(heap)
+            done = np.zeros(n, bool)
+            while heap:
+                d, i = heapq.heappop(heap)
+                if done[i]:
+                    continue
+                done[i] = True
+                better = d + self.edges[i] < dist
+                for j in np.flatnonzero(better & ~done):
+                    dist[j] = d + self.edges[i, j]
+                    heapq.heappush(heap, (dist[j], j))
+        if len(self._from_source) >= 64:
+            # A source dragged across the map leaves a trail of positions.
+            self._from_source.clear()
+        self._from_source[key] = dist
+        return dist
+
+    def lengths(self, points: np.ndarray, sources: np.ndarray, blocked: np.ndarray) -> np.ndarray:
+        """Path lengths ``(n_points, n_sources)`` for the pairs `blocked` marks
+        (the others are not computed and read inf)."""
+        out = np.full(blocked.shape, np.inf)
+        if not len(self.nodes):
+            return out
+        seen = ~_blocked(points[:, None, :], self.nodes[None, :, :], self.rects)
+        leg = np.where(seen, np.linalg.norm(points[:, None, :] - self.nodes[None, :, :], axis=-1), np.inf)
+        for j in np.flatnonzero(blocked.any(axis=0)):
+            total = leg + self.distances_from(sources[j])[None, :]
+            rows = np.flatnonzero(blocked[:, j])
+            out[rows, j] = total[rows].min(axis=1)
+        return out
+
+
+@dataclass
+class WalledOdorField(OdorField):
+    """`OdorField` in a room with solids: odour goes round them, not through.
+
+    Intensity keeps the inverse-square law, but `d` is the length of the
+    shortest path from source to sensor that stays out of every solid
+    (`PathGraph`), with the height difference added in quadrature. Wherever a
+    source is in plain view of a sensor this is the straight line and the
+    reading is bit-identical to `OdorField`'s, so an open room, and every
+    measurement calibrated in one (the Kenyon-cell working range, the steering
+    asymmetries), is unchanged. Behind a wall the reading is weaker and its
+    left-right difference points round the wall's end.
+
+    This is geometry standing in for physics. Still air carries odour round a
+    wall by diffusion, and the steady state of that is not exactly inverse
+    square in the path length; PLAN.md B-1's grid solution of the diffusion
+    equation would be the physical version. It would also change the field in
+    the open room, which is what every calibration here was measured in -- the
+    reason this came first. A room with no way round (a closed box) reads zero.
+
+    Args:
+        solids: Called on every read; returns the solids as objects with
+            ``cx, cy, hx, hy`` (`flyplay.room.Rect`). The graph is rebuilt only
+            when they change.
+        room_half: Interior half-width of the room. Sources outside it -- parked
+            pool slots -- are read in a straight line, as before.
+    """
+
+    solids: Callable[[], list] | None = None
+    room_half: float = 50.0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self._graph: PathGraph | None = None
+        self._graph_key: tuple | None = None
+
+    def graph(self) -> PathGraph | None:
+        rects = self.solids() if self.solids is not None else []
+        if not rects:
+            return None
+        key = tuple((r.cx, r.cy, r.hx, r.hy) for r in rects)
+        if key != self._graph_key:
+            self._graph = PathGraph(np.array(key), self.room_half)
+            self._graph_key = key
+        return self._graph
+
+    def read(self, sim) -> np.ndarray:
+        if not self.sources:
+            return np.zeros((N_SENSORS, max(self.n_dimensions, 1)))
+        sensors = self.sensor_positions(sim)  # (4, 3)
+        positions = self.positions
+        delta = sensors[:, None, :] - positions[None, :, :]  # (4, n_src, 3)
+        distance = np.linalg.norm(delta, axis=-1)  # (4, n_src)
+        graph = self.graph()
+        if graph is not None:
+            distance = self._round_walls(graph, sensors, positions, distance)
+        falloff = np.maximum(distance, self.min_distance) ** self.exponent
+        return falloff @ self.peaks  # (4, n_dim)
+
+    def path_distance(self, points: np.ndarray, positions: np.ndarray, distance: np.ndarray) -> np.ndarray:
+        """`distance` ``(n_points, n_src)`` with every pair a solid hides replaced
+        by the path round it. Points ``(n_points, 3)``, source positions
+        ``(n_src, 3)``. For maps and checks as well as `read`."""
+        graph = self.graph()
+        return distance if graph is None else self._round_walls(graph, points, positions, distance)
+
+    def _round_walls(self, graph: PathGraph, sensors, positions, distance) -> np.ndarray:
+        in_room = np.all(np.abs(positions[:, :2]) <= self.room_half, axis=1)
+        if not in_room.any():
+            return distance
+        which = np.flatnonzero(in_room)
+        points, sources = sensors[:, :2], positions[which, :2]
+        blocked = _blocked(points[:, None, :], sources[None, :, :], graph.rects)
+        if not blocked.any():
+            return distance
+        around = graph.lengths(points, sources, blocked)
+        rise = sensors[:, None, 2] - positions[None, which, 2]
+        out = distance.copy()
+        sub = out[:, which]
+        sub[blocked] = np.sqrt(around[blocked] ** 2 + rise[blocked] ** 2)
+        out[:, which] = sub
+        return out

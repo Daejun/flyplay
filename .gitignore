@@ -15,3 +15,6 @@ __pycache__/
 # Local tool state
 .claude/settings.local.json
 .playwright-mcp/
+
+# Downloaded source data (scripts/18_build_brain_data.py fetches it again)
+data/raw/

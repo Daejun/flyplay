@@ -216,7 +216,7 @@ class ForageEnv(gym.Env):
         self.fs.sim.reset()
         self.fs.sim.warmup(0.3)
         self.retina.calibrate_horizon(
-            self.fs.sim.get_ommatidia_readouts(self.fs.name)
+            self.fs.ommatidia_readouts()
         )
 
     def _layout_episode(self, rng) -> None:
@@ -389,7 +389,7 @@ class ForageEnv(gym.Env):
     def _look(self) -> np.ndarray:
         if self.config.blind:
             return np.zeros(N_VISION_FEATURES, dtype=np.float32)
-        readouts = self.fs.sim.get_ommatidia_readouts(self.fs.name)
+        readouts = self.fs.ommatidia_readouts()
         # Kept so a viewer can show what the fly sees without paying for a
         # second eye render (they cost 25 ms each).
         self.last_readouts = readouts

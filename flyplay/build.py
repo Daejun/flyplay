@@ -290,6 +290,8 @@ class FlySim:
         self.room: Room | None = None
         #: Motor-driven proboscis hinges, empty unless built with `proboscis`.
         self._proboscis = self.fly.get_actuated_jointdofs_order(ActuatorType.MOTOR)
+        #: Built on the first `ommatidia_readouts` call, on that thread.
+        self._eye_readout = None
 
     @property
     def thorax_body_id(self) -> int:
@@ -348,6 +350,22 @@ class FlySim:
         if getattr(self, "_tarsus_forces", None) is None:
             self._tarsus_forces = ContactForces(self.sim, self.name, self._tarsus5)
         return np.linalg.norm(self._tarsus_forces(), axis=1) > force_threshold
+
+    def ommatidia_readouts(self) -> np.ndarray:
+        """What the two eyes read, ``(2, n_ommatidia, 2)``, left eye first.
+
+        `flyplay.retina_fast.EyeReadout` in place of
+        `Simulation.get_ommatidia_readouts`: the same float32 array, from one
+        gather instead of a fisheye pass and a pooling pass (7.07 ms both eyes
+        down to 1.96 on a pinned core; see that module). Built on first use,
+        so a scene without eyes never pays for the retina, and built on the
+        thread that asks -- eye renderers belong to their thread.
+        """
+        if getattr(self, "_eye_readout", None) is None:
+            from flyplay.retina_fast import EyeReadout
+
+            self._eye_readout = EyeReadout(self.sim, self.name)
+        return self._eye_readout()
 
     def odor(self) -> np.ndarray:
         """Odour intensity at the four sensors, shape ``(4, n_dimensions)``."""

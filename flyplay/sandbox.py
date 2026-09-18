@@ -20,9 +20,10 @@ because remembering a *place* is the central complex's job (Ofstad et al. 2011)
 and that is not built yet. Put a colour patch or an odour with it and the fly
 can learn to keep away.
 
-**Odour passes through walls and obstacles** in this version: intensity is the
-inverse-square field of `flyplay.odor`, as in NeuroMechFly v2. Fine in the open
-room; misleading behind a block. PLAN.md B-1 replaces it.
+**Odour goes round walls and obstacles, not through them.** Intensity is the
+inverse-square field of NeuroMechFly v2 over the shortest path round the room's
+solids (`flyplay.odor.WalledOdorField`): unchanged wherever the source is in
+plain view, weaker behind a block, and pointing round its end.
 
 **Memory has four compartments, with the literature's speeds** (all fitted to
 nothing; the time scales are the papers', the rates are model choices):
@@ -78,7 +79,10 @@ Brain, in priority order (first that applies drives the legs):
 
 from __future__ import annotations
 
+import copy
+import secrets
 import threading
+import time as wallclock
 from array import array
 from collections import deque
 from dataclasses import dataclass, field
@@ -90,10 +94,12 @@ from flygym.anatomy import LEGS, BodySegment
 from flyplay.build import build
 from flyplay.control import Walker
 from flyplay.env import SIGNAL_HIGH, SIGNAL_LOW
+from flyplay.central_complex import CentralComplex, landmark_view
+from flyplay.motion_vision import MotionVision
 from flyplay.mushroom_body import Compartment, MushroomBody
-from flyplay.odor import OdorField, OdorSource
-from flyplay.olfactory import OlfactoryFrontEnd
-from flyplay.room import POOL_SIZES, SUGAR_RADIUS, ZONE_HALF, ProximityReflex
+from flyplay.odor import OdorField, OdorSource, WalledOdorField
+from flyplay.olfactory import NOMINAL_ACTIVE, ConnectomeFrontEnd, OlfactoryFrontEnd
+from flyplay.room import MOVING_KINDS, POOL_SIZES, SUGAR_RADIUS, ZONE_HALF, ProximityReflex
 from flyplay.visual_pathway import FLOOR_READINGS, VisualFrontEnd, floor_readouts
 
 # --- stimuli -------------------------------------------------------------------
@@ -113,6 +119,24 @@ ODOUR_RGBA = {
 #: Odour source peak intensity range. At `ODOR_MIN_DISTANCE` 3 mm a peak of 1.0
 #: gives 0.111, the top of the Kenyon-cell working range.
 MIN_DISTANCE = 3.0
+
+# --- the mushroom body's layout ------------------------------------------------------
+
+#: The Kenyon-cell lobes each compartment's output neuron reads (Aso et al.
+#: 2014): gamma1pedc for fast punishment, alpha3 for slow punishment, beta'2 and
+#: gamma4 for sweet taste, gamma5 and alpha1 for nutrient reward.
+COMPARTMENT_LOBES: dict[str, tuple[str, ...]] = {
+    "approach_fast": ("gamma",),
+    "approach_slow": ("ab",),
+    "avoid_sweet": ("apbp", "gamma"),
+    "avoid_nutrient": ("gamma", "ab"),
+}
+#: Visual Kenyon cells in the hemibrain (Li et al. 2020): 99 gamma-d, then 60
+#: alpha/beta-p.
+VISUAL_KC_LOBES = (("gamma", 99), ("ab", 60))
+#: The code the learning rates below were chosen with: 5% of 2000 cells, all
+#: reaching every compartment (`SandboxConfig.brain` "random").
+RATE_CODE_SIZE = 100
 
 
 @dataclass(frozen=True)
@@ -201,6 +225,25 @@ def shock_drive(volts: float, v50: float = 20.0) -> float:
     return volts**3 / (volts**3 + v50**3)
 
 
+#: Floor temperature where no heat zone is, degrees C: the 24-25.5 C flies choose
+#: on a gradient (Bang et al. 2011; Kaneko et al. 2012).
+AMBIENT_TEMP = 25.0
+
+
+def heat_drive(celsius: float, half: float = 34.0) -> float:
+    """Punishment dopamine for standing on a floor this warm, saturating.
+
+    Heat punishes through a subset of the shock pathway's dopamine neurons,
+    PPL1-gamma1pedc among them (Galili et al. 2014; Otto et al. 2020). The shape
+    is `shock_drive`'s, zero at 30 C and half at `half`: 0.77 at the 36 C of the
+    heat maze (Ofstad et al. 2011), 0.94 at the 40 C of the heat box (Putz &
+    Heisenberg 2002). Not fitted.
+    """
+    excess = max(0.0, float(celsius) - 30.0)
+    width = half - 30.0
+    return excess**3 / (excess**3 + width**3)
+
+
 def duration_ko(seconds: float) -> str:
     """A duration as the page and the report say it: 30초, 15분, 1시간 30분, 2일."""
     seconds = max(0.0, float(seconds))
@@ -277,6 +320,15 @@ TRIAL_METRICS: list[Metric] = [
            "방을 두 냄새 중 더 가까운 쪽으로 나누어 (첫째 냄새 쪽 시간 - 둘째 냄새 쪽 시간) ÷ (두 시간의 합)으로 "
            "셉니다. 어느 냄새가 첫째(+1)인지는 '냄새 선호 기준' 칸에 있습니다.", ("odour_pair",), 0.1),
     Metric("odour_pi_pair", "냄새 선호 기준", "냄새 선호의 +1 쪽과 -1 쪽 냄새입니다.", ("odour_pair",), text=True),
+    Metric("shadow_passes", "그림자 지나감(번)", "머리 위로 그림자가 지나간 횟수입니다.", ("shadow",), 1.0),
+    Metric("freeze_s", "얼어붙은 시간(초)", "그림자에 놀라 걸음을 멈추고 얼어붙어 있던 시간의 합입니다.", ("shadow",), 1.0),
+    Metric("turn_ccw_dps", "반시계로 돈 속도(°/s)",
+           "초파리가 위에서 볼 때 반시계 방향으로 돈 각도를 시간으로 나눈 값입니다. 시계 방향으로 돌면 음수입니다.",
+           ("drum",), 5.0),
+    Metric("first_cool_s", "시원한 곳 찾기(초)",
+           "뜨거운 바닥에서 시작해 몸이 시원한 바닥(27 °C 이하)에 1초 넘게 처음 머물기까지 걸린 시간입니다. 못 찾으면 빈칸입니다.",
+           ("heat",), 2.0, latency=True),
+    Metric("hot_s", "뜨거운 바닥 위(초)", "30 °C가 넘는 바닥 위에 있던 시간의 합입니다.", ("heat",), 2.0),
     Metric("distance_mm", "이동 거리(mm)", "0.1초마다 잰 위치를 이은 길이입니다.", (), 20.0),
     Metric("speed_mms", "평균 속도(mm/s)", "이동 거리 ÷ 시행 시간입니다. 먹거나 멈춘 시간도 포함합니다.", (), 1.0),
     Metric("still_pct", "멈춰 있던 시간(%)",
@@ -297,6 +349,13 @@ METRICS_BY_KEY = {m.key: m for m in TRIAL_METRICS}
 class SandboxConfig:
     action_hz: float = 100.0
     vision_hz: float = 10.0
+    #: The olfactory front end. "connectome": receptor responses from DoOR,
+    #: one fly's claws resampled from the hemibrain, lobes, per-lobe APL, and
+    #: compartments that read their own lobes (`flyplay.olfactory.
+    #: ConnectomeFrontEnd`). "random": random receptors and claws, a top-k
+    #: code, every compartment reading every cell -- the model every result
+    #: before 2026-09-17 23:00 was measured with.
+    brain: str = "connectome"
     #: Depression rate of the fast compartments, as in the conditioning tasks;
     #: the slow punishment compartment learns a tenth as fast, the nutrient one
     #: half (one 2-min sucrose pairing already forms long-term memory --
@@ -321,6 +380,51 @@ class SandboxConfig:
     shock_rearm_seconds: float = 1.0
     turn_gain: float = 80.0
     visual_gain: float = 3.0
+    #: Eye samples per second while something in the room moves by itself
+    #: (`flyplay.room.MOVING_KINDS`): the motion detectors need them
+    #: (`flyplay.motion_vision`). In a room where nothing moves the eyes stay
+    #: at `vision_hz` and motion vision is not computed: its output would be the
+    #: fly's own turning and walking, which the model takes as cancelled by an
+    #: efference copy, and sampling at 100 Hz there would slow every experiment.
+    motion_hz: float = 100.0
+    #: Optomotor turning: turn command per unit of wide-field rotation, after
+    #: dividing by `rotation_scale` and a tanh, low-passed over
+    #: `optomotor_tau`. Suppressed during the fly's own saccades (an efference
+    #: copy; Kim et al. 2015). No walking turning speeds in deg/s were found in
+    #: the literature's text, so the gain is a model choice. Measured, 4 flies,
+    #: 30 s in the room with the drum turning counterclockwise at 60 deg/s
+    #: against still (scratch `tune_calibrate.py`): at 0.3 two flies circled the
+    #: walls clockwise all the same (-15.4 and -13.4 deg/s, their still twins
+    #: -15.4 and -19.8); at 1.0 all four turned counterclockwise at +17.1 to
+    #: +21.0 deg/s against -19.8 to +18.8, walking speed 14.1 mm/s either way.
+    optomotor_gain: float = 1.0
+    rotation_scale: float = 0.01
+    optomotor_tau: float = 0.2
+    #: Overhead dimming that counts as a shadow passing (`MotionState.overhead`;
+    #: measured values in `flyplay.motion_vision.DORSAL_QUANTILE`).
+    shadow_threshold: float = 0.15
+    #: Arousal from passing shadows (Gibson et al. 2015): each pass adds 1 and
+    #: it decays over `arousal_tau`, about the 20 s their flies' activity took
+    #: to settle. Walking drive rises by `arousal_speed` per unit, up to
+    #: `arousal_max_drive` (turning authority shrinks as the drive nears 1.6) --
+    #: model choices for "speed rises with the number of passes".
+    arousal_tau: float = 20.0
+    arousal_speed: float = 0.08
+    arousal_max_drive: float = 1.3
+    #: Freezing right after a pass, for a slow and a fast walker: 76.7% and
+    #: 26.8% of flies froze to looming (Zacarias et al. 2018), about 30% of
+    #: single flies to a passing paddle (Gibson et al. 2015). Only a shadow after
+    #: `freeze_rearm` quiet seconds can freeze the fly: Gibson's passes a second
+    #: apart made flies run faster with each, and letting every pass freeze
+    #: chained freezes through a burst -- measured with 3 s freezes and no rearm,
+    #: a fly under five passes every 10 s spent 28 of 60 s frozen and walked at
+    #: 9.1 mm/s against 14.0 without shadows, the opposite of their result. How
+    #: long a freeze lasts was not found; `freeze_seconds` is a model choice.
+    freeze_slow: float = 0.77
+    freeze_fast: float = 0.27
+    slow_speed: float = 5.0
+    freeze_seconds: float = 2.0
+    freeze_rearm: float = 5.0
     #: Exploratory saccades: rate per second and size, from walking flies in
     #: plumes (Demir et al. 2020: ~1.3 turns/s of 30 +/- 10 degrees).
     explore_rate: float = 1.33
@@ -351,6 +455,17 @@ class SandboxConfig:
     #: in 0.23 s, measured) instead of walking off with it out. A wall or a
     #: shock ends a meal without this pause.
     retract_seconds: float = 0.3
+    #: Drinking needs the labellum in the liquid: flies spread it on contact and
+    #: its taste pegs touch the food only then (Zhou et al. 2019). A fly whose
+    #: labellum misses the drop -- standing at the rim facing out -- stops
+    #: sipping, turns toward the drop's centre and creeps (`reach_drive` for
+    #: `reach_seconds`; feeding micromovements run at 0.2-2 mm/s,
+    #: Corrales-Carvajal et al. 2016), then extends again. Off: sipping drains
+    #: the drop wherever the labellum is (earlier versions).
+    labellum_contact: bool = True
+    reach_after: float = 0.3
+    reach_seconds: float = 0.25
+    reach_drive: float = 0.25
     shock_v50: float = 20.0
     escape_v50: float = 45.0
     escape_seconds: float = 0.6
@@ -360,6 +475,85 @@ class SandboxConfig:
     search_seconds: float = 30.0
     search_per_hunger: float = 90.0
     search_radius: float = 12.0
+    #: The central complex (`flyplay.central_complex`): a drifting compass that
+    #: learns the panorama, a path integrator, and goals. Local search returns
+    #: to the last meal by its estimates instead of the drop's true place, and
+    #: a cool spot found on a hot floor becomes a goal steered toward, with
+    #: `goal_gain` of turn, whenever the floor is hot again. Off: search by the
+    #: true place, no place memory (earlier versions).
+    central_complex: bool = True
+    goal_gain: float = 0.6
+    #: Seconds on hot floor before reaching cool floor counts as relief, and
+    #: remembers the place.
+    relief_after: float = 1.0
+    #: Heat avoidance. At a border into heat most walking flies U-turn, turning
+    #: away from the warmer antenna (Simoes et al. 2021: a 0.1-0.2 C difference
+    #: between the antennae predicts the direction). A U-turn starts when the
+    #: antennae are `heat_border` degrees warmer than the floor under the body;
+    #: on a hot floor the fly walks faster by `heat_speed` times the heat drive
+    #: and makes saccades `heat_saccades` times as often. Model choices.
+    heat_border: float = 3.0
+    heat_uturn_deg: float = 160.0
+    heat_speed: float = 0.3
+    heat_saccades: float = 2.0
+    #: Bitter taste. A bitter additive silences the sugar cells it shares a
+    #: drop with (Meunier et al. 2003; Chu et al. 2014): sweetness is scaled by
+    #: 1 - bitter. Tasted through the legs it drives punishment dopamine
+    #: (PPL1; Kirkhart & Scott 2015; Das et al. 2014) at `bitter_punish` per
+    #: unit. A fly starts feeding only while what is left of the sweetness is
+    #: above `bitter_refuse`.
+    bitter_punish: float = 0.8
+    bitter_refuse: float = 0.2
+    #: Excursions lengthen as the search goes on (Behbahani et al. 2021): the
+    #: distance at which the fly turns back grows from this to `search_radius`.
+    #: The numbers are model choices; equal values give the fixed radius of
+    #: earlier versions.
+    search_radius_start: float = 4.0
+    #: Individual differences, drawn from the fly's seed (`Individual`), so the
+    #: twins of an A/B set share them. Off, every fly is the population average.
+    individuality: bool = True
+    #: Spread of each fly's left/right saccade bias, Beta(a, a): Buchanan et al.
+    #: (2015) found 23.5% of Canton-S flies turning one way more than 70% of the
+    #: time; Beta(4.2, 4.2) puts 24.0% there.
+    handedness_beta: float = 4.2
+    #: Spread (sd of the log) of each fly's walking drive and wall affinity.
+    #: Both persist in a fly (Werkhoven et al. 2021); the sizes are model choices.
+    speed_spread: float = 0.1
+    wall_spread: float = 0.3
+    #: Wall following (Soibam et al. 2012): with a wall within `wall_range` mm
+    #: to one side, steer to hold it at `wall_distance`, `wall_gain` of turn per
+    #: mm of error. Blind flies follow walls as well as sighted ones, so it reads
+    #: the proximity reflex's distances, not the eyes. `wall_distance` sits where
+    #: the reflex's 25-degree front ray (7 mm) no longer reaches a wall running
+    #: alongside (4.5 / sin 25 = 10.6 mm). Off gives earlier versions' fly.
+    wall_following: bool = True
+    wall_range: float = 8.0
+    wall_distance: float = 4.5
+    wall_gain: float = 0.4
+    #: Along a wall the walk is more persistent (Soibam et al. 2012's model:
+    #: a persistent walker plus wall attraction): exploratory saccades come at
+    #: this fraction of their rate. A model choice.
+    wall_saccades: float = 0.5
+
+
+@dataclass(frozen=True)
+class Individual:
+    """What makes one fly differ from another, apart from its wiring."""
+
+    #: Chance that an exploratory saccade goes left.
+    left_bias: float = 0.5
+    #: Multiplies the walking drive while exploring or searching.
+    speed: float = 1.0
+    #: Multiplies the wall-following gain.
+    wall_affinity: float = 1.0
+
+    @classmethod
+    def draw(cls, seed: int, config: "SandboxConfig") -> "Individual":
+        # Its own generator: the fly's behaviour draws stay where they were.
+        rng = np.random.default_rng([int(seed), 7907])
+        return cls(left_bias=float(rng.beta(config.handedness_beta, config.handedness_beta)),
+                   speed=float(np.exp(rng.normal(0.0, config.speed_spread))),
+                   wall_affinity=float(np.exp(rng.normal(0.0, config.wall_spread))))
 
 
 # --- runtime ----------------------------------------------------------------------
@@ -383,9 +577,18 @@ class Trail:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.epoch = 0
+        # Random, not 0: a page left open across a viewer restart keeps the old
+        # process's epoch, and an equal number would make it keep a stale copy.
+        self.epoch = secrets.randbelow(2**30)
         self._xy = array("f")
         self.dropped = 0
+
+    def load(self, xy: array, dropped: int) -> None:
+        """Take over a saved trail (`flyplay.session`), as a new epoch."""
+        with self._lock:
+            self._xy = array("f", xy)
+            self.dropped = int(dropped)
+            self.epoch += 1
 
     def clear(self) -> None:
         with self._lock:
@@ -440,17 +643,34 @@ class Telemetry:
     reflex: list = field(default_factory=list)
 
 
+class RestoreRefused(ValueError):
+    """A saved fly that cannot be restored into this one. `code` is ASCII for
+    the console, `text` Korean for the page."""
+
+    def __init__(self, code: str, text: str):
+        super().__init__(code)
+        self.code = code
+        self.text = text
+
+
 class Sandbox:
     """One fly in the sealed room. `step` advances one 100 Hz action step."""
 
     def __init__(self, config: SandboxConfig | None = None, *, seed: int = 0):
         self.config = cfg = config or SandboxConfig()
+        #: The wiring seed: the mushroom body's fixed matrices and the body.
+        self.seed = int(seed)
         self.rng = np.random.default_rng(seed)
-        # One odour source per room odour slot, parked until placed.
-        self.odor_field = OdorField(
+        self.individual = Individual.draw(seed, cfg) if cfg.individuality else Individual()
+        self.cx = CentralComplex(np.random.default_rng([int(seed), 4099])) if cfg.central_complex else None
+        # One odour source per room odour slot, parked until placed. The field
+        # asks the room for its obstacles on every read (the room is built
+        # below, with the body).
+        self.odor_field = WalledOdorField(
             sources=[OdorSource(pos=(900.0, 900.0, 1.5), peak=(0.0,) * len(ODOURS))
                      for _ in range(POOL_SIZES["odour"])],
             min_distance=MIN_DISTANCE,
+            solids=lambda: [item.rect for item in self.room.of_kind("obstacle")],
         )
         # Plain body: the eyes see the fly's own legs, and coloured legs changed
         # the visual Kenyon-cell code on 57% of samples. The viewer paints its
@@ -459,19 +679,42 @@ class Sandbox:
                         vision=True, room=True, colorize=False, proboscis=True, seed=seed)
         self.room = self.fs.room
         self.walker = Walker(self.fs)
+        #: The haustellum's geom, whose centre stands for the labellum.
+        self._labellum = mujoco.mj_name2id(self.fs.sim.mj_model, mujoco.mjtObj.mjOBJ_GEOM,
+                                           f"{self.fs.name}/c_haustellum")
 
-        front = OlfactoryFrontEnd(len(ODOURS), seed=seed)
-        visual = VisualFrontEnd(seed=seed)
+        if cfg.brain == "random":
+            front = OlfactoryFrontEnd(len(ODOURS), seed=seed)
+            visual = VisualFrontEnd(seed=seed)
+            lobes = None
+        elif cfg.brain == "connectome":
+            front = ConnectomeFrontEnd(ODOURS, seed=seed)
+            visual = VisualFrontEnd(n_kc=sum(n for _, n in VISUAL_KC_LOBES), seed=seed)
+            lobes = np.concatenate([front.lobes, *[[lobe] * n for lobe, n in VISUAL_KC_LOBES]])
+        else:
+            raise ValueError(f"brain is 'connectome' or 'random'; got {cfg.brain!r}")
         n_kc = front.n_kc + visual.n_kc
+
+        def compartment(name: str, sign: float, eta: float, recovery: float) -> Compartment:
+            if lobes is None:
+                return Compartment(name, sign, n_kc=n_kc, eta=eta, recovery=recovery)
+            cells = np.isin(lobes, COMPARTMENT_LOBES[name])
+            olfactory = cells[:front.n_kc]
+            # The rates were chosen for a code of RATE_CODE_SIZE cells reaching
+            # every compartment. Here a compartment reads its lobes' part of the
+            # code, rescaled to sum to 1 (`Compartment.coverage`), spread over
+            # about NOMINAL_ACTIVE of those lobes' cells; scaling the rate by
+            # that many cells over RATE_CODE_SIZE keeps one pairing's
+            # depression where it was.
+            size = NOMINAL_ACTIVE * float(olfactory.sum())
+            return Compartment(name, sign, n_kc=n_kc, eta=eta * size / RATE_CODE_SIZE,
+                               recovery=recovery, cells=cells, coverage=float(olfactory.mean()))
+
         self.mb = MushroomBody(front, [
-            Compartment("approach_fast", +1.0, n_kc=n_kc, eta=cfg.eta,
-                        recovery=cfg.recovery_fast),
-            Compartment("approach_slow", +1.0, n_kc=n_kc, eta=cfg.eta * cfg.eta_slow_factor,
-                        recovery=cfg.recovery_slow),
-            Compartment("avoid_sweet", -1.0, n_kc=n_kc, eta=cfg.eta,
-                        recovery=cfg.recovery_sweet),
-            Compartment("avoid_nutrient", -1.0, n_kc=n_kc,
-                        eta=cfg.eta * cfg.eta_nutrient_factor, recovery=cfg.recovery_nutrient),
+            compartment("approach_fast", +1.0, cfg.eta, cfg.recovery_fast),
+            compartment("approach_slow", +1.0, cfg.eta * cfg.eta_slow_factor, cfg.recovery_slow),
+            compartment("avoid_sweet", -1.0, cfg.eta, cfg.recovery_sweet),
+            compartment("avoid_nutrient", -1.0, cfg.eta * cfg.eta_nutrient_factor, cfg.recovery_nutrient),
         ], visual=visual)
         self.reflex = ProximityReflex()
 
@@ -480,6 +723,13 @@ class Sandbox:
         self.dt = 1.0 / cfg.action_hz
         self.steps_per_action = int(round(self.dt / self.fs.sim.timestep))
         self._look_every = max(1, int(round(cfg.action_hz / cfg.vision_hz)))
+        self._motion_every = max(1, int(round(cfg.action_hz / cfg.motion_hz)))
+        self.motion = MotionVision(self._motion_every / cfg.action_hz)
+        self._motion_state = None
+        #: When each moving stimulus was placed, simulated seconds: it animates from there.
+        self._moving_t0: dict[str, float] = {}
+        self._shadow_pass: int | None = None
+        self.arousal = 0.0
         #: Whether feeding uses drops up. Off, a drop never shrinks: the room's
         #: layout stays exactly as placed however long the fly eats. A room
         #: setting, so it survives `reset_fly`.
@@ -502,9 +752,14 @@ class Sandbox:
         """A new fly in the same room: memory wiped, hunger reset, back to the
         centre -- facing +x, or `yaw` radians from it."""
         self.mb.reset()
+        if self.cx is not None:
+            self.cx.reset()
         self._clear_actions()
         self._settle_body(yaw)
         self.time = 0.0
+        self.arousal = 0.0
+        # A new fly's clock starts at zero; the moving stimuli start with it.
+        self._moving_t0 = {kind: 0.0 for kind in self._moving_t0}
         self.hunger = self.config.hunger_start
         self._i = 0
         self._last_fed_at = -1e9
@@ -558,6 +813,9 @@ class Sandbox:
     def _settle_body(self, yaw: float | None, xy: tuple[float, float] = (0.0, 0.0)) -> None:
         """Reset the body to (x, y), by default the centre, and let it settle:
         0.2 s of physics."""
+        # This settles physics without going through `Sandbox.step`, so the
+        # bounding spheres have to be real ones again first.
+        self.room.ungate()
         self.walker.reset(seed=int(self.rng.integers(2**31 - 1)), warmup_s=0.0)
         if yaw is not None or any(xy):
             model, data = self.fs.sim.mj_model, self.fs.sim.mj_data
@@ -587,25 +845,38 @@ class Sandbox:
         self._feeding_on: int | None = None
         self._feed_reach = 0.0
         self._feed_started = 0.0
+        self._creep_until = -1e9
         self._retract_until = -1e9
         # Local search loops back to the last meal by dead reckoning, which a
         # jump to the centre invalidates.
         self._food_xy: np.ndarray | None = None
         self._search_until = -1e9
+        self._search_started = -1e9
         self._was_shocked = False
         self._shock_pulse_left = 0
         self._enduring = False
+        self._freeze_until = -1e9
+        self._last_shadow_at = -1e9
+        self._floor_temp = AMBIENT_TEMP
+        self._hot_for = 0.0
+        # Picked up or set down: the compass loses its alignment.
+        self._cx_last = None
+        self._cx_eyes_at = None
+        if getattr(self, "cx", None) is not None:
+            self.cx.put_down()
+        self._optomotor = 0.0
+        self._overhead_high = False
+        self._speed = 0.0
+        if hasattr(self, "motion"):
+            self.motion.reset()
+            self._motion_state = None
 
     def reset_counts(self) -> None:
         """Start the tallies a trial reports from zero, keeping the fly."""
-        self.counts = {"shocks": 0, "shock_seconds": 0.0, "feed_bouts": 0,
-                       "feed_seconds": 0.0, "by_sugar": {}, "first_feed_s": None,
-                       "first_touch_s": None, "first_shock_s": None,
-                       "on_blue_s": 0.0, "on_green_s": 0.0,
-                       "near_s": {o: 0.0 for o in ODOURS}, "still_s": 0.0, "distance_mm": 0.0,
-                       "side_s": {"blue": 0.0, "green": 0.0, **{o: 0.0 for o in ODOURS}}}
+        self.counts = self._fresh_counts()
         self._counts_since = self.time
         self._last_xy = None
+        self._last_yaw = None
         # A trial's first shock counts even if the last trial's was under a
         # second ago.
         self._last_shock_at = -1e9
@@ -614,6 +885,17 @@ class Sandbox:
         self.seen = self.contents()
         #: The path since the counts began, 5 Hz: (seconds, x, y).
         self.path: list[tuple[float, float, float]] = []
+
+    @staticmethod
+    def _fresh_counts() -> dict:
+        return {"shocks": 0, "shock_seconds": 0.0, "feed_bouts": 0,
+                "feed_seconds": 0.0, "by_sugar": {}, "first_feed_s": None,
+                "first_touch_s": None, "first_shock_s": None,
+                "on_blue_s": 0.0, "on_green_s": 0.0,
+                "near_s": {o: 0.0 for o in ODOURS}, "still_s": 0.0, "distance_mm": 0.0,
+                "side_s": {"blue": 0.0, "green": 0.0, **{o: 0.0 for o in ODOURS}},
+                "shadow_passes": 0, "freeze_s": 0.0, "turn_deg": 0.0, "drum_s": 0.0,
+                "hot_s": 0.0, "heat_turns": 0, "first_cool_s": None, "cool_run_s": 0.0, "reaches": 0}
 
     def rest(self, seconds: float) -> None:
         """Time passes with the fly out of the room, as between the trials of a
@@ -624,6 +906,8 @@ class Sandbox:
         if seconds <= 0.0:
             return
         self.mb.idle(seconds)
+        if self.cx is not None:
+            self.cx.idle(seconds)
         self.hunger = float(min(1.0, self.hunger + self.config.hunger_rise_per_s * seconds))
         self.time += seconds
         self._clear_actions()
@@ -650,6 +934,128 @@ class Sandbox:
     def close(self) -> None:
         self.fs.close()
 
+    # --- carried across processes (flyplay.session) ---------------------------------
+
+    def snapshot(self) -> tuple[dict, dict[str, np.ndarray]]:
+        """This fly and its room as plain data, for `restore` in another process.
+        Call between steps, from the thread that steps.
+
+        Kept: every synapse, hunger, both clocks, the room with what is left of
+        each drop, the trial tallies and path, the event log, the random
+        generator and where the fly stands. Not kept: what it was in the middle
+        of -- a meal, a saccade, an escape, a shock pulse -- which ends, as when
+        the fly is moved, and the posture of its legs, which settle afresh where
+        it stood.
+        """
+        pos = self.fs.thorax_pos()
+        meta = {
+            "saved_at": wallclock.strftime("%Y-%m-%d %H:%M:%S"),
+            "seed": self.seed,
+            "wiring": self.mb.wiring_signature(),
+            "compartments": list(self.mb.names),
+            "time": self.time,
+            "sim_time": float(self.fs.sim.mj_data.time),
+            "hunger": self.hunger,
+            "arousal": self.arousal,
+            "sugar_depletes": self.sugar_depletes,
+            "fly": {"x": float(pos[0]), "y": float(pos[1]), "yaw": float(self.fs.yaw())},
+            "items": [self.item_spec(i) for i in self.room.items],
+            "next_id": self.room._next_id,
+            "counts": copy.deepcopy(self.counts),
+            "counts_since": self._counts_since,
+            "seen": sorted(self.seen),
+            "path": [list(point) for point in self.path],
+            "events": list(self.events),
+            "rng": self.rng.bit_generator.state,
+        }
+        arrays = {f"weights_{c.name}": c.weights.copy() for c in self.mb.compartments}
+        if self.cx is not None:
+            meta["central_complex"], cx_arrays = self.cx.state()
+            arrays.update(cx_arrays)
+        return meta, arrays
+
+    def restore(self, meta: dict, arrays: dict[str, np.ndarray],
+                trail: tuple[array, int] | None = None) -> list[str]:
+        """Become the fly `snapshot` saved, in its room. Returns what could not
+        be put back, as page text (an item this version no longer knows).
+
+        Raises `RestoreRefused`, having changed nothing, when the synapses were
+        learned on other wiring or other compartments: weights index Kenyon
+        cells, and on a front end that codes things differently they would sit
+        on the wrong cells without any error.
+        """
+        if meta.get("wiring") != self.mb.wiring_signature():
+            raise RestoreRefused("wiring", "뇌 배선(냄새·색 부호)이 저장할 때와 달라졌습니다")
+        if meta.get("compartments") != list(self.mb.names):
+            raise RestoreRefused("compartments", "버섯체 구획 구성이 저장할 때와 달라졌습니다")
+        for c in self.mb.compartments:
+            weights = arrays.get(f"weights_{c.name}")
+            if weights is None or weights.shape != c.weights.shape:
+                raise RestoreRefused("weights", "저장된 시냅스 수가 지금 버섯체와 다릅니다")
+
+        skipped = []
+        self.clear()
+        for spec in meta.get("items", []):
+            try:
+                self.place(spec["kind"], spec["x"], spec["y"], item_id=spec["item_id"], **spec["params"])
+            except (KeyError, ValueError, TypeError) as error:
+                skipped.append(f"{spec.get('kind')} ({spec.get('x', 0):.0f}, {spec.get('y', 0):.0f}): {error}")
+        self.room._next_id = max(self.room._next_id, int(meta.get("next_id", 1)))
+        self.sugar_depletes = bool(meta.get("sugar_depletes", True))
+
+        # The body first: settling it resets the physics and uses the generator.
+        fly = meta.get("fly") or {}
+        self._put_down(float(fly.get("x", 0.0)), float(fly.get("y", 0.0)), float(fly.get("yaw", 0.0)))
+        for c in self.mb.compartments:
+            c.weights[:] = arrays[f"weights_{c.name}"]
+        self.hunger = float(np.clip(meta.get("hunger", self.config.hunger_start), 0.0, 1.0))
+        self.arousal = float(meta.get("arousal", 0.0))
+        self.time = float(meta.get("time", 0.0))
+        # Placed before the clock was set: the moving stimuli start from it.
+        self._moving_t0 = {kind: self.time for kind in self._moving_t0}
+        self.fs.sim.mj_data.time = float(meta.get("sim_time", self.fs.sim.mj_data.time))
+        # Saved tallies over fresh ones, so a measure added since starts at zero.
+        counts = self._fresh_counts()
+        for key, value in (meta.get("counts") or {}).items():
+            if key not in counts:
+                continue
+            if isinstance(counts[key], dict) and isinstance(value, dict):
+                counts[key].update({k: v for k, v in value.items() if key == "by_sugar" or k in counts[key]})
+            else:
+                counts[key] = value
+        self.counts = counts
+        self._counts_since = float(meta.get("counts_since", self.time))
+        self.seen = set(meta.get("seen", [])) | self.contents()
+        self.path = [tuple(point) for point in meta.get("path", [])]
+        self._last_xy = None
+        self._last_shock_at = -1e9
+        self.events = deque(meta.get("events", []), maxlen=40)
+        if meta.get("rng"):
+            self.rng.bit_generator.state = meta["rng"]
+        if trail is not None:
+            self.trail.load(*trail)
+        if self.cx is not None and meta.get("central_complex"):
+            self.cx.load(meta["central_complex"], arrays)
+        self.refresh_telemetry()
+        return skipped
+
+    def _put_down(self, x: float, y: float, yaw: float) -> None:
+        """`move_fly` to (x, y), or to the first point toward the centre where
+        the body can stand: the fly may have been saved closer to a wall than
+        `move_fly` allows."""
+        for k in range(21):
+            f = 1.0 - k / 20.0
+            try:
+                self.move_fly(x * f, y * f, yaw)
+                return
+            except ValueError:
+                continue
+        clock = self.fs.sim.mj_data.time
+        self._clear_actions()
+        self._settle_body(yaw)
+        self.fs.sim.mj_data.time = clock
+        self.trail.clear()
+
     def _event(self, text: str) -> None:
         self.events.append({"t": round(self.time, 1), "text": text})
 
@@ -659,6 +1065,11 @@ class Sandbox:
         params = self._validated(kind, params)
         item = self.room.place(kind, x, y, item_id=item_id, **params)
         self._sync_item(item)
+        if kind in MOVING_KINDS:
+            self._moving_t0[kind] = self.time
+            # Posed now, not at the next step: a still drum is placed where it
+            # will stay, and a paused room shows it.
+            self.room.animate({kind: 0.0})
         return item.as_dict()
 
     def move(self, item_id: int, x: float, y: float) -> dict:
@@ -683,6 +1094,7 @@ class Sandbox:
             self.odor_field.sources[item.slot].pos = (900.0, 900.0, 1.5)
         if self._feeding_on == item_id:
             self._feeding_on = None
+        self._moving_t0.pop(item.kind, None)
         self.room.remove(item_id)
 
     def clear(self) -> None:
@@ -708,6 +1120,7 @@ class Sandbox:
             # What is left survives edits of concentration or type; setting an
             # amount (`update` with volume) refills the drop to it.
             p["left"] = float(np.clip(p.get("left", p["volume"]), 0.0, p["volume"]))
+            p["bitter"] = float(np.clip(p.get("bitter", 0.0), 0.0, 1.0))
             p["radius"] = drop_radius(p["left"])
             p["rgba"] = SUGARS[p["sugar"]].rgba
         elif kind == "shock":
@@ -729,6 +1142,18 @@ class Sandbox:
                 raise ValueError(f"unknown odour {p['odour']!r}")
             p["strength"] = float(np.clip(p.get("strength", 1.0), 0.05, 1.0))
             p["rgba"] = ODOUR_RGBA[p["odour"]]
+        elif kind == "heat":
+            p["temp"] = float(np.clip(p.get("temp", 36.0), 15.0, 45.0))
+            p["half"] = float(np.clip(p.get("half", ZONE_HALF), 3.0, 50.0))
+        elif kind == "light":
+            p["target"] = p.get("target", "punish")
+            if p["target"] not in ("punish", "reward"):
+                raise ValueError(f"unknown dopamine target {p['target']!r}")
+            p["intensity"] = float(np.clip(p.get("intensity", 1.0), 0.0, 1.0))
+            p["half"] = float(np.clip(p.get("half", ZONE_HALF), 3.0, 30.0))
+        elif kind in MOVING_KINDS:
+            # Clamped by the room; nothing is at a place.
+            p.pop("half", None)
         return p
 
     def _sync_item(self, item) -> None:
@@ -743,14 +1168,31 @@ class Sandbox:
 
     def step(self) -> None:
         cfg = self.config
-        if self._i % self._look_every == 0:
-            self._readouts = self.fs.sim.get_ommatidia_readouts(self.fs.name)
+        shadow = {}
+        if self._moving_t0:
+            shadow = self.room.animate({kind: self.time - t0 for kind, t0 in self._moving_t0.items()})
+        # A still drum is a panorama, not motion: the eyes stay at vision_hz.
+        moving = "shadow" in self._moving_t0 or any(
+            item.params.get("speed", 0.0) != 0.0 for item in self.room.of_kind("drum"))
+        looked = self._i % (self._motion_every if moving else self._look_every) == 0
+        if looked:
+            self._readouts = self.fs.ommatidia_readouts()
+            if moving:
+                self._motion_state = self.motion(self._readouts)
+        if not moving and self._motion_state is not None:
+            self.motion.reset()
+            self._motion_state = None
+            self._optomotor = 0.0
         self._i += 1
+        if moving:
+            self._see_motion(shadow)
 
         intensities = self.odor_field.read(self.fs.sim)
         concentration = intensities.mean(axis=0)
         xy = self.fs.thorax_pos()[:2]
         yaw = self.fs.yaw()
+        if self.cx is not None:
+            self._central_complex(xy, yaw, looked)
         tips = self.fs.sim.get_body_positions(self.fs.name)[self._tips][:, :2]
         down = self.fs.leg_contacts()
 
@@ -785,12 +1227,28 @@ class Sandbox:
         if feeding_item is not None:
             sugar = SUGARS[feeding_item.params["sugar"]]
             drive = sugar_drive(feeding_item.params["molar"])
-            sweet = sugar.sweet * drive
+            sweet = sugar.sweet * drive * (1.0 - feeding_item.params.get("bitter", 0.0))
             nutrient = sugar.nutrient * drive
+        # Heat under the body and bitterness under the feet punish like a shock.
+        self._floor_temp = self.floor_temperature(float(xy[0]), float(xy[1]))
+        if self._floor_temp > 30.0:
+            punish = max(punish, heat_drive(self._floor_temp))
+            self.counts["hot_s"] += self.dt
+        bitter = max((self.room.items[i].params.get("bitter", 0.0) for i in sugar_legs), default=0.0)
+        if bitter > 0.0:
+            punish = max(punish, cfg.bitter_punish * bitter)
+        # Light zones drive dopamine neurons directly, as CsChrimson does: no
+        # sense involved, and no hunger gate on what is written.
+        lit = {"punish": 0.0, "reward": 0.0}
+        for zone in self.room.of_kind("light"):
+            if zone.rect.contains(float(xy[0]), float(xy[1])):
+                lit[zone.params["target"]] = max(lit[zone.params["target"]], zone.params["intensity"])
         # Hunger gates what is written (module docstring): sugar reward only as
         # far as the fly is hungry, long-term punishment only as far as it is fed.
+        punish = max(punish, lit["punish"])
         dan = {"approach_fast": punish, "approach_slow": punish * (1.0 - self.hunger),
-               "avoid_sweet": sweet * self.hunger, "avoid_nutrient": nutrient * self.hunger}
+               "avoid_sweet": max(sweet * self.hunger, lit["reward"]),
+               "avoid_nutrient": max(nutrient * self.hunger, lit["reward"])}
         state = self.mb.step(concentration, dan, self.dt, readouts=self._readouts)
 
         # --- hunger ---
@@ -811,6 +1269,9 @@ class Sandbox:
         self.fs.set_proboscis(1.0 if sipping else 0.0, lift)
         half = min(mid - SIGNAL_LOW, SIGNAL_HIGH - mid) if mid > 0 else 0.0
         self.walker.descending_signal = np.array([mid - half * turn, mid + half * turn])
+        # Only the solids within reach of the fly keep their bounding spheres
+        # for the next 10 ms of physics; see `Room.gate_bounds`.
+        self.room.gate_bounds(float(xy[0]), float(xy[1]))
         self.walker.advance(self.steps_per_action)
         self.time += self.dt
 
@@ -832,8 +1293,27 @@ class Sandbox:
             self.counts["feed_seconds"] += self.dt
             name = feeding_item.params["sugar"]
             self.counts["by_sugar"][name] = self.counts["by_sugar"].get(name, 0.0) + self.dt
-            if sipping:
+            if sipping and (not cfg.labellum_contact or self._labellum < 0 or self.labellum_on(feeding_item)):
                 self._drink(feeding_item)
+        if self.arousal > 0.0:
+            self.arousal *= float(np.exp(-self.dt / cfg.arousal_tau))
+        if self.counts["first_cool_s"] is None and "heat" in self.seen:
+            # Reaching a cool spot counts once the body has stayed off the heat
+            # for a second: a leg's worth of a border crossing is not arriving.
+            if self._floor_temp <= AMBIENT_TEMP + 2.0:
+                self.counts["cool_run_s"] += self.dt
+                if self.counts["cool_run_s"] >= 1.0:
+                    self.counts["first_cool_s"] = round(self.time - self._counts_since - 1.0, 2)
+            else:
+                self.counts["cool_run_s"] = 0.0
+        if mode == "freeze":
+            self.counts["freeze_s"] += self.dt
+        if self._i % 10 == 0 and "drum" in self._moving_t0:
+            # Turning measured at 10 Hz, unwrapped: counterclockwise positive.
+            if self._last_yaw is not None:
+                self.counts["turn_deg"] += float(np.degrees(np.angle(np.exp(1j * (yaw - self._last_yaw)))))
+                self.counts["drum_s"] += 10 * self.dt
+            self._last_yaw = yaw
         if self._i % 10 == 0:
             x, y = float(xy[0]), float(xy[1])
             self.trail.append(x, y)
@@ -843,6 +1323,7 @@ class Sandbox:
             if self._last_xy is not None:
                 moved = float(np.linalg.norm(xy - self._last_xy))
                 self.counts["distance_mm"] += moved
+                self._speed = moved / sample
                 if moved < STILL_SPEED * sample:
                     self.counts["still_s"] += sample
             self._last_xy = xy.copy()
@@ -889,6 +1370,7 @@ class Sandbox:
             self._enduring = False
         if shocks:
             self._stop_feeding("전기에 놀라 먹기를 멈췄습니다", hold=False)
+            self._freeze_until = -1e9
             zone = shocks[0]
             bearing = np.arctan2(zone.y - xy[1], zone.x - xy[0]) - yaw
             away = -np.sign(np.sin(bearing)) or 1.0
@@ -897,6 +1379,20 @@ class Sandbox:
         if self._escape_left > 0:
             self._escape_left -= 1
             return "escape", 0.0, 1.4
+
+        # 2a. Heat ahead: the antennae are warmer than the floor under the body.
+        antennae = self.odor_field.sensor_positions(self.fs.sim)[2:, :2]
+        warm = [self.floor_temperature(float(a[0]), float(a[1])) for a in antennae]
+        if max(warm) - self._floor_temp >= cfg.heat_border and self._saccade_left == 0 and self._feeding_on is None:
+            # Away from the warmer antenna: left warmer turns right (negative).
+            self._saccade_sign = -1.0 if warm[0] > warm[1] else 1.0 if warm[1] > warm[0] else (
+                1.0 if self.rng.random() < self.individual.left_bias else -1.0)
+            self._saccade_left = int(cfg.heat_uturn_deg / 228.0 * cfg.action_hz)
+            self.counts["heat_turns"] += 1
+
+        # 2b. A shadow just passed overhead and the fly froze.
+        if self.time < self._freeze_until and self._feeding_on is None:
+            return "freeze", 0.0, 0.0
 
         # 3. Feeding: stand on a sweet drop while hungry.
         if self._feeding_on is not None:
@@ -909,16 +1405,30 @@ class Sandbox:
                     self._stop_feeding("배가 불러 먹기를 멈췄습니다" if self.hunger < 0.4
                                        else "먹기를 멈췄습니다")
                 else:
+                    item = self.room.items[self._feeding_on]
+                    if (cfg.labellum_contact and self._labellum >= 0
+                            and self.time - self._feed_started >= cfg.per_latency + cfg.reach_after
+                            and not self.labellum_on(item)):
+                        # Missed: fold, creep toward the middle, extend again.
+                        self._creep_until = self.time + cfg.reach_seconds
+                        self._feed_started = self._creep_until
+                        self.counts["reaches"] += 1
+                    if self.time < self._creep_until:
+                        bearing = np.arctan2(item.y - xy[1], item.x - xy[0]) - yaw
+                        return "feed", float(np.clip(2.0 * np.sin(bearing), -1.0, 1.0)), cfg.reach_drive
                     return "feed", 0.0, 0.0
         elif sugar_legs and self.hunger > cfg.feed_threshold \
                 and self.time - self._last_fed_at > cfg.feed_refractory:
             item_id = max(sugar_legs, key=sugar_legs.get)
             item = self.room.items[item_id]
-            if sugar_legs[item_id] >= 2 and SUGARS[item.params["sugar"]].sweet > 0.0:
+            taste = SUGARS[item.params["sugar"]].sweet * (1.0 - item.params.get("bitter", 0.0))
+            if sugar_legs[item_id] >= 2 and taste > (cfg.bitter_refuse if item.params.get("bitter", 0.0) > 0 else 0.0):
                 self._feeding_on = item_id
                 self._feed_started = self.time
                 self._feed_reach = self._taste_radius(item)
                 self._food_xy = np.array([item.x, item.y])
+                if self.cx is not None:
+                    self.cx.mark_food()
                 self.counts["feed_bouts"] += 1
                 if self.counts["first_feed_s"] is None:
                     self.counts["first_feed_s"] = self.time - self._counts_since
@@ -933,11 +1443,34 @@ class Sandbox:
         searching = self._food_xy is not None and self.time < self._search_until
 
         # 5. Navigation: learned and innate steering plus exploratory saccades.
-        turn = self._odour_turn(intensities) + self._visual_turn(state)
-        if searching and np.linalg.norm(xy - self._food_xy) > cfg.search_radius:
-            bearing = np.arctan2(self._food_xy[1] - xy[1], self._food_xy[0] - xy[0]) - yaw
-            turn += float(np.sin(bearing))
+        turn = self._odour_turn(intensities) + self._visual_turn(state) + cfg.optomotor_gain * self._optomotor
+        along_wall = False
+        if cfg.wall_following:
+            wall = self._wall_turn()
+            along_wall = wall != 0.0
+            turn += wall
+        if searching:
+            span = max(self._search_until - self._search_started, 1e-9)
+            grown = min(1.0, (self.time - self._search_started) / span)
+            radius = cfg.search_radius_start + (cfg.search_radius - cfg.search_radius_start) * grown
+            if self.cx is not None and self.cx.food is not None:
+                # Back to where the integrator says the meal was, compass errors and all.
+                back, away = self.cx.steer(self.cx.food)
+                if away > radius:
+                    turn += back
+            elif np.linalg.norm(xy - self._food_xy) > radius:
+                bearing = np.arctan2(self._food_xy[1] - xy[1], self._food_xy[0] - xy[0]) - yaw
+                turn += float(np.sin(bearing))
+        if self.cx is not None and self.cx.goal is not None and self._floor_temp > 30.0:
+            # On a hot floor, toward the cool place remembered (PFL3 steering).
+            toward, _ = self.cx.steer(self.cx.goal)
+            turn += cfg.goal_gain * self.cx.goal_strength * toward
         rate = cfg.explore_rate * (3.0 if searching else 1.0)
+        if along_wall:
+            rate *= cfg.wall_saccades
+        hot = heat_drive(self._floor_temp)
+        if hot > 0.0:
+            rate *= cfg.heat_saccades
         if self._saccade_left > 0:
             self._saccade_left -= 1
             turn = self._saccade_sign
@@ -945,8 +1478,132 @@ class Sandbox:
             angle = abs(self.rng.normal(cfg.explore_deg, cfg.explore_sd_deg))
             # 228 deg/s at full turn, measured.
             self._saccade_left = int(angle / 228.0 * cfg.action_hz)
-            self._saccade_sign = float(self.rng.choice((-1.0, 1.0)))
-        return ("search" if searching else "explore"), float(np.clip(turn, -1.0, 1.0)), 1.0
+            if cfg.individuality:
+                self._saccade_sign = 1.0 if self.rng.random() < self.individual.left_bias else -1.0
+            else:
+                self._saccade_sign = float(self.rng.choice((-1.0, 1.0)))
+        drive = min(cfg.arousal_max_drive,
+                    (1.0 + cfg.arousal_speed * self.arousal + cfg.heat_speed * hot) * self.individual.speed)
+        return ("search" if searching else "explore"), float(np.clip(turn, -1.0, 1.0)), drive
+
+    def _central_complex(self, xy: np.ndarray, yaw: float, looked: bool) -> None:
+        """Feed the compass and integrator the fly's own motion since the last
+        step (in its body frame), the panorama when the eyes were read, and
+        heat relief."""
+        cfg = self.config
+        if self._cx_last is not None:
+            last_xy, last_yaw = self._cx_last
+            turned = float(np.angle(np.exp(1j * (yaw - last_yaw))))
+            dx, dy = xy - last_xy
+            c, s = np.cos(-last_yaw), np.sin(-last_yaw)
+            moved = np.array([c * dx - s * dy, s * dx + c * dy])
+            view, view_dt = None, 0.0
+            if looked and self._readouts is not None:
+                view = landmark_view(self._readouts)
+                view_dt = self.time - self._cx_eyes_at if self._cx_eyes_at is not None else 0.0
+                self._cx_eyes_at = self.time
+            self.cx.step(turned, moved, self.dt, view, view_dt)
+        elif looked:
+            self._cx_eyes_at = self.time
+        self._cx_last = (xy.copy(), yaw)
+        # Relief: cool floor after a spell on hot floor. That place becomes the goal.
+        if self._floor_temp > 30.0:
+            self._hot_for += self.dt
+        elif self._floor_temp <= AMBIENT_TEMP + 2.0:
+            if self._hot_for >= cfg.relief_after:
+                self.cx.remember_goal()
+                self._event("뜨거운 바닥에서 시원한 곳을 찾았습니다. 이 자리를 기억합니다")
+            self._hot_for = 0.0
+
+    def cx_view(self) -> dict | None:
+        """What the central complex believes, in room coordinates for the map:
+        where it thinks its goal and its last meal are (from where it is now,
+        through its own heading estimate), and how far that estimate is off."""
+        if self.cx is None:
+            return None
+        xy = self.fs.thorax_pos()[:2]
+        offset = self.fs.yaw() - self.cx.heading
+        c, s = np.cos(offset), np.sin(offset)
+
+        def believed(point):
+            if point is None:
+                return None
+            v = np.asarray(point) - self.cx.position
+            return [round(float(xy[0] + c * v[0] - s * v[1]), 1), round(float(xy[1] + s * v[0] + c * v[1]), 1)]
+
+        return {"goal": believed(self.cx.goal), "goal_strength": round(self.cx.goal_strength, 2),
+                "food": believed(self.cx.food),
+                "heading_error_deg": round(float(np.degrees(np.angle(np.exp(1j * offset)))), 0)}
+
+    def labellum_on(self, item) -> bool:
+        """Whether the labellum is over the drop, within its tasting radius."""
+        tip = self.fs.sim.mj_data.geom_xpos[self._labellum]
+        return bool(np.hypot(tip[0] - item.x, tip[1] - item.y) <= self._taste_radius(item))
+
+    def floor_temperature(self, x: float, y: float) -> float:
+        """Degrees C at a point of the floor: the hottest heat zone there, else ambient."""
+        temps = [z.params["temp"] for z in self.room.of_kind("heat") if z.rect.contains(x, y)]
+        return max(temps) if temps else AMBIENT_TEMP
+
+    #: Sines of the proximity reflex's side rays (50 and 80 degrees), for the
+    #: perpendicular distance to a wall alongside.
+    _SIN50, _SIN80 = float(np.sin(np.deg2rad(50.0))), float(np.sin(np.deg2rad(80.0)))
+
+    def _wall_turn(self) -> float:
+        """Steer to hold a wall alongside at `wall_distance` (config)."""
+        cfg = self.config
+        d = getattr(self, "_reflex_distances", None)
+        if d is None or len(d) != 7:
+            return 0.0
+        # Rays at -80, -50, -25, 0, 25, 50, 80 degrees; positive is left.
+        left = min(d[5] * self._SIN50, d[6] * self._SIN80)
+        right = min(d[1] * self._SIN50, d[0] * self._SIN80)
+        lateral = min(left, right)
+        if lateral >= cfg.wall_range:
+            return 0.0
+        side = 1.0 if left < right else -1.0
+        error = lateral - cfg.wall_distance
+        return float(np.clip(side * cfg.wall_gain * self.individual.wall_affinity * error, -0.5, 0.5))
+
+    def moving_view(self) -> dict:
+        """Where the moving stimuli are now, for the page's map: the drum's
+        turn in degrees and the shadow bar's x (None between passes)."""
+        out: dict = {}
+        drum = next((i for i in self.room.items.values() if i.kind == "drum"), None)
+        if drum is not None and "drum" in self._moving_t0:
+            out["drum_deg"] = round(float(drum.params["speed"]) * (self.time - self._moving_t0["drum"]) % 360.0, 1)
+        if "shadow" in self._moving_t0:
+            x = self.room.sim.mj_data.mocap_pos[self.room.mocap["shadow"]]
+            out["shadow_x"] = round(float(x[0]), 1) if x[2] > 0 else None
+        return out
+
+    def _see_motion(self, shadow: dict) -> None:
+        """Act on what the motion detectors saw this step: optomotor drive, and
+        a shadow's arrival overhead. Counts the shadow's passes as they start."""
+        cfg = self.config
+        passing = shadow.get("pass")
+        if passing is not None and passing != self._shadow_pass:
+            self.counts["shadow_passes"] += 1
+        self._shadow_pass = passing
+        state = self._motion_state
+        if state is None:
+            return
+        rotation = float(np.tanh(state.rotation / cfg.rotation_scale))
+        self._optomotor += (rotation - self._optomotor) * (1.0 - np.exp(-self.dt / cfg.optomotor_tau))
+        if self._saccade_left > 0:
+            self._optomotor = 0.0
+        high = state.overhead > cfg.shadow_threshold
+        if high and not self._overhead_high:
+            self.arousal += 1.0
+            quiet = self.time - self._last_shadow_at >= cfg.freeze_rearm
+            self._last_shadow_at = self.time
+            chance = cfg.freeze_slow if self._speed < cfg.slow_speed else cfg.freeze_fast
+            if quiet and self._feeding_on is None and self.rng.random() < chance:
+                self._freeze_until = self.time + cfg.freeze_seconds
+                self._event("머리 위 그림자에 놀라 얼어붙었습니다")
+            else:
+                self._event("머리 위 그림자에 놀라 걸음이 빨라집니다")
+        self._overhead_high = high
 
     def _taste_radius(self, item) -> float:
         """How close a planted foot must be to a drop's centre to taste it, mm.
@@ -998,6 +1655,7 @@ class Sandbox:
         self._last_fed_at = self.time
         if hold:
             self._retract_until = self.time + self.config.retract_seconds
+        self._search_started = self.time
         self._search_until = self.time + self.config.search_seconds \
             + self.config.search_per_hunger * self.hunger
         self._event(text)
@@ -1015,7 +1673,9 @@ class Sandbox:
         """
         w0 = self.mb.compartments[0].w0
         rest = w0 * mass
-        below = {c.name: rest - float(c.weights @ kc) for c in self.mb.compartments}
+        # A compartment reading only its lobes rescales its input itself.
+        below = {c.name: (rest - float(c.weights @ kc)) if c.cells is None else c.below_rest(kc)
+                 for c in self.mb.compartments}
         aversive = below["approach_fast"] + below["approach_slow"]
         appetitive = below["avoid_sweet"] + below["avoid_nutrient"]
         return appetitive, aversive
@@ -1130,6 +1790,11 @@ class Sandbox:
             **{f"near_{o}_pct": (pct(c["near_s"][o]) if o in present else None) for o in ODOURS},
             "odour_pi": index(c["side_s"][pair[0]], c["side_s"][pair[1]]) if pair else None,
             "odour_pi_pair": (f"{ODOUR_LABELS[pair[0]]}+ / {ODOUR_LABELS[pair[1]]}-" if pair else None),
+            "first_cool_s": when("first_cool_s", "heat"),
+            "hot_s": round(c["hot_s"], 1) if "heat" in seen else None,
+            "shadow_passes": c["shadow_passes"] if "shadow" in seen else None,
+            "freeze_s": round(c["freeze_s"], 1) if "shadow" in seen else None,
+            "turn_ccw_dps": round(c["turn_deg"] / c["drum_s"], 2) if "drum" in seen and c["drum_s"] > 0 else None,
             "distance_mm": round(c["distance_mm"], 1),
             "speed_mms": round(c["distance_mm"] / span, 2),
             "still_pct": pct(c["still_s"]),
@@ -1194,8 +1859,8 @@ def _wall(x0: float, y0: float, x1: float, y1: float) -> tuple:
     return ("obstacle", x0, (y0 + y1) / 2, {"hx": _WALL, "hy": abs(y1 - y0) / 2})
 
 
-def _sugar(x, y, sugar="sucrose", molar=1.0, volume=100.0, odour=None, strength=1.0):
-    entries = [("sugar", x, y, {"sugar": sugar, "molar": molar, "volume": volume})]
+def _sugar(x, y, sugar="sucrose", molar=1.0, volume=100.0, odour=None, strength=1.0, bitter=0.0):
+    entries = [("sugar", x, y, {"sugar": sugar, "molar": molar, "volume": volume, "bitter": bitter})]
     if odour:
         entries.append(("odour", x, y, {"odour": odour, "strength": strength}))
     return entries
@@ -1215,6 +1880,23 @@ _T_MAZE = [
 #: Four blocks leaving a plus-shaped corridor 18 mm wide, the fly at its centre.
 _PLUS_MAZE = [("obstacle", sx * 29.5, sy * 29.5, {"hx": 20.5, "hy": 20.5})
               for sx in (-1.0, 1.0) for sy in (-1.0, 1.0)]
+
+
+def _heat(x0, y0, hx, hy, temp=36.0):
+    return ("heat", x0, y0, {"hx": hx, "hy": hy, "half": max(hx, hy), "temp": temp})
+
+
+#: A floor at 36 C with one 20 mm cool square centred at (25, 25): Ofstad et al.
+#: (2011) held their floor at 36 C with one cool tile. Four rectangles tile it.
+_HEAT_FLOOR = [
+    _heat(-17.5, 0.0, 32.5, 50.0),
+    _heat(42.5, 0.0, 7.5, 50.0),
+    _heat(25.0, -17.5, 10.0, 32.5),
+    _heat(25.0, 42.5, 10.0, 7.5),
+]
+#: The still drum with three dark bars of different widths: a panorama to
+#: learn a place by (Ofstad et al. 2011 used bars in three orientations).
+_PANORAMA = ("drum", 0.0, 0.0, {"speed": 0.0, "pattern": "landmarks"})
 
 
 def _odour(x, y, odour, strength=1.0):
@@ -1397,6 +2079,30 @@ PRESETS: dict[str, tuple[str, list]] = {
           if (x, y) != (38.0, 12.0)],
         _patch(38.0, 12.0, "green"),
     ]),
+    # --- moving things ---
+    "drum_turning": ("돌아가는 줄무늬 원통 (반시계 60°/s)", [("drum", 0.0, 0.0, {"speed": 60.0})]),
+    "drum_still": ("멈춘 줄무늬 원통", [("drum", 0.0, 0.0, {"speed": 0.0})]),
+    "shadow_bursts": ("머리 위로 지나가는 그림자 (10초마다 5번)", [
+        ("shadow", 0.0, 0.0, {"interval": 10.0, "passes": 5, "gap": 1.0}),
+    ]),
+    "shadow_sugar": ("그림자가 지나가는 방의 식초 설탕", [
+        ("shadow", 0.0, 0.0, {"interval": 10.0, "passes": 5, "gap": 1.0}),
+        *_sugar(28.0, 22.0, odour="vinegar"),
+    ]),
+    # --- heat and light ---
+    "heat_maze": ("뜨거운 바닥의 시원한 칸 (표지 막대 있음)", [*_HEAT_FLOOR, _PANORAMA]),
+    "heat_maze_plain": ("뜨거운 바닥의 시원한 칸 (표지 없음)", list(_HEAT_FLOOR)),
+    "heat_probe": ("시험 방: 시원한 칸 없이 뜨거운 바닥 (표지 막대 90° 돌림)", [
+        _heat(0.0, 0.0, 50.0, 50.0), ("drum", 0.0, 0.0, {"speed": 0.0, "pattern": "landmarks", "offset": 90.0})]),
+    "bitter_sugar": ("쓴맛을 섞은 식초 설탕", _sugar(28.0, 22.0, odour="vinegar", bitter=0.6)),
+    "light_punish_odour": ("옥탄올 자리에 처벌 빛 (광유전학 흉내)", [
+        _odour(20.0, 15.0, "octanol"), ("light", 20.0, 15.0, {"target": "punish", "half": 12.0}),
+        _odour(-20.0, -15.0, "mch"),
+    ]),
+    "light_reward_odour": ("MCH 자리에 보상 빛 (광유전학 흉내)", [
+        _odour(20.0, 15.0, "mch"), ("light", 20.0, 15.0, {"target": "reward", "half": 12.0}),
+        _odour(-20.0, -15.0, "octanol"),
+    ]),
     # --- walls and mazes ---
     "wall_between": ("벽 너머의 설탕", [
         _wall(14.0, -24.0, 14.0, 24.0),
@@ -1514,10 +2220,20 @@ PRESET_NOTES: dict[str, str] = {
     "shock_band": "설탕에 가려면 전기 띠를 건너야 합니다. 배고픔이 아픔을 이기는지 봅니다.",
     "cued_shocks": "전기 구역마다 MCH 냄새가 납니다. 몇 번 겪고 나면 냄새만 맡고도 피하는지 봅니다.",
     "green_island": "전기가 없는 초록 섬을 찾아 머물게 되는지 봅니다.",
-    "wall_between": "냄새는 벽을 통과하지만 초파리는 벽을 돌아가야 합니다.",
+    "heat_maze": "바닥이 36 °C로 뜨겁고 오른쪽 위 한 칸만 시원합니다. 방 바깥의 표지 막대로 그 자리를 기억해 점점 빨리 찾는지 봅니다.",
+    "heat_maze_plain": "표지가 없는 같은 방입니다. 초파리는 놓일 때마다 방향 감각을 잃으니 자리를 기억하기 어렵습니다.",
+    "heat_probe": "시원한 칸이 없고 표지 막대가 90° 돌아가 있습니다. 기억한 자리를 표지 기준으로 찾는지 봅니다.",
+    "bitter_sugar": "쓴맛이 단맛 세포를 누르고 처벌 도파민을 냅니다. 덜 먹는지, 식초 냄새를 싫어하게 되는지 봅니다.",
+    "light_punish_odour": "빛이 처벌 도파민 뉴런을 직접 켭니다(실제 실험의 광유전학). 전기 없이도 옥탄올을 피하게 되는지 봅니다.",
+    "light_reward_odour": "빛이 보상 도파민 뉴런을 직접 켭니다. 설탕 없이도 MCH를 좋아하게 되는지 봅니다.",
+    "drum_turning": "방 바깥의 줄무늬가 반시계로 돕니다. 초파리가 움직임을 보고 따라 도는지(시운동 반응) 봅니다.",
+    "drum_still": "줄무늬 원통이 멈춰 있습니다. 돌아가는 원통과 비교하는 대조 방입니다.",
+    "shadow_bursts": "검은 막대가 10초마다 1초 간격으로 5번 머리 위를 지나갑니다. 얼어붙거나 빨라지는지 봅니다.",
+    "shadow_sugar": "그림자에 놀라는 동안에도 식초 냄새를 따라 설탕을 찾는지 봅니다.",
+    "wall_between": "냄새도 초파리도 벽 끝을 돌아가야 합니다.",
     "two_rooms": "문을 찾아 건너편 방으로 가는지 봅니다.",
     "corridor": "좁은 통로를 따라 끝까지 가는지 봅니다.",
-    "room_in_room": "냄새는 새어 나오지만 들어가는 문은 아래쪽 하나뿐입니다.",
+    "room_in_room": "냄새는 아래쪽 문으로만 새어 나오고, 들어가는 길도 그 문 하나뿐입니다.",
     "t_maze": "갈림길에서 식초 냄새가 나는 팔을 고르는지 봅니다.",
     "t_maze_octanol": "옥탄올은 원래 끌림이 없어, 설탕 맛을 본 뒤에야 그 팔을 골라 가는지 봅니다.",
     "plus_maze": "네 갈래 중 냄새가 나는 갈래를 고르는지 봅니다.",
@@ -1540,6 +2256,9 @@ PRESET_GROUPS: list[tuple[str, list[str]]] = [
                     "compound_cue", "octanol_sugar_far"]),
     ("학습 - 시험 방", ["odour_choice", "colour_choice", "colour_quadrants", "t_maze_odours"]),
     ("갈등과 장소", ["safe_vs_shocked", "conflict", "volt_choice", "shock_band", "cued_shocks", "green_island"]),
+    ("움직임", ["drum_turning", "drum_still", "shadow_bursts", "shadow_sugar"]),
+    ("온도·빛·쓴맛", ["heat_maze", "heat_maze_plain", "heat_probe", "bitter_sugar", "light_punish_odour",
+                  "light_reward_odour"]),
     ("벽과 미로", ["wall_between", "two_rooms", "corridor", "room_in_room", "t_maze", "t_maze_octanol", "plus_maze",
                 "plus_maze_odours", "zigzag", "dead_end_maze", "pillars", "obstacle_field"]),
 ]

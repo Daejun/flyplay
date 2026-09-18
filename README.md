@@ -45,7 +45,7 @@ py -3.12 -m venv .venv
 
 화면이 없는 리눅스 서버에서는 `MUJOCO_GL=egl`도 필요합니다.
 
-**3. 설치 확인.** 버섯체 점검 29개와 감각 점검 10개가 모두 PASS면 됩니다. 각각 1분 안에 끝납니다.
+**3. 설치 확인.** 버섯체 점검 38개와 감각 점검 10개가 모두 PASS면 됩니다. 각각 1분 안에 끝납니다.
 
 ```bash
 .venv\Scripts\python.exe scripts\13_mb_check.py --no-plot
@@ -57,6 +57,10 @@ py -3.12 -m venv .venv
 ```bash
 .venv\Scripts\python.exe scripts\09_web_viewer.py --sandbox
 ```
+
+같은 일을 하는 `run_viewer.bat`이 저장소 루트에 있습니다. 두 번 누르면 뷰어를 켜고, 포트가 응답하면
+브라우저를 엽니다. 바로 가기를 만들려면 이 파일의 바로 가기를 만들고 아이콘으로 `flyplay.ico`를 고르면
+됩니다. 뒤에 붙인 것은 그대로 `09_web_viewer.py`로 넘어갑니다(`run_viewer.bat --session other --fresh`).
 
 브라우저에서 <http://localhost:8000>을 엽니다. 오른쪽 지도에 설탕·전기·냄새·색 바닥·벽을 놓고 초파리의
 반응을 보고, 영상 아래 **A/B 실험실**에서 질문을 골라 배경 실험을 돌린 뒤 판정과 탐구 보고서를 봅니다.
@@ -90,7 +94,8 @@ GPU 벤치마크(`scripts\08_gpu_benchmark.py`)는 `requirements-gpu.txt`를 더
 - `main` — 개발 중인 버전입니다.
 
 [Apache License 2.0](LICENSE)을 따릅니다. FlyGym/NeuroMechFly v2(Apache-2.0) 위에서 만들었고, 출처는
-[NOTICE](NOTICE)에 있습니다.
+[NOTICE](NOTICE)에 있습니다. `flyplay/data/`의 측정 데이터 표는 원본의 라이선스를 따릅니다(DoOR에서 뽑은 표는
+CC BY-SA 4.0, hemibrain에서 뽑은 표는 CC BY 4.0). 자세한 출처는 [flyplay/data/SOURCES.md](flyplay/data/SOURCES.md)에 있습니다.
 
 ---
 
@@ -174,10 +179,16 @@ MuJoCo 네이티브 뷰어는 키보드 대부분을 자기가 가로채기 때�
 .venv\Scripts\python.exe scripts\09_web_viewer.py --conditioning --port 8010
 ```
 
-**샌드박스 모드** (`--sandbox`) — 사각 밀폐 방에 설탕·전기·냄새·색 바닥·벽을 클릭으로 놓고 초파리
-반응을 봅니다. 방 프리셋 50개, 지나온 길(무한까지)과 히트맵. **A/B 실험실**에서 질문 하나에 조건 A·B
-한 쌍인 실험 세트(22개)를 골라 배경에서 여러 마리를 돌리고, 시행을 3D로 다시 보고, 가설 판정이 들어간
-탐구보고서를 엽니다. 명령줄로는 `scripts\17_run_experiment.py --set shock_odour`.
+**샌드박스 모드** (`--sandbox`) — 사각 밀폐 방에 설탕(쓴맛 섞기 가능)·전기·냄새·색 바닥·벽·뜨거운 바닥·빛 도파민
+구역·돌아가는 줄무늬 원통·머리 위 그림자를 클릭으로 놓고 초파리 반응을 봅니다. 방 프리셋 61개, 지나온 길(무한까지)과
+히트맵. **A/B 실험실**에서 질문 하나에 조건 A·B 한 쌍인 실험 세트(26개)를 골라 배경에서 여러 마리를 돌리고, 시행을 3D로
+다시 보고, 가설 판정과 "확실히 보이려면 파리가 몇 마리 필요한지"가 들어간 탐구보고서를 엽니다. 명령줄로는
+`scripts\17_run_experiment.py --set shock_odour`.
+
+샌드박스 초파리의 뇌는 측정 데이터 위에 있습니다. 냄새는 DoOR 수용체 반응과 hemibrain 케니언 세포 배선(엽마다 APL
+억제)으로 부호화되고, 움직임은 T4/T5형 감지기로 보고, 중심복합체형 나침반과 경로 적분으로 뜨거운 바닥의 시원한 곳을 방
+바깥 표지 기준으로 기억합니다. 초파리마다 좌우 편향과 걷는 속도가 조금씩 다르고, 벽을 따라 걷습니다. 서버를 다시 켜도 같은
+초파리가 이어집니다(`--session`, 새로 시작은 `--fresh`). 근거는 [RESEARCH.md](RESEARCH.md) 15절.
 
 **강화학습 모드** — 직접 조종, `--policy`(완성된 정책이 운전), `--follow`(학습 중인
 정책을 봄: 최신 체크포인트를 에피소드 경계에서 갈아끼우고, 상단에 학습 스텝과 최근
@@ -628,11 +639,15 @@ flyplay\                        프로젝트 루트
 │   ├── vision.py               해석적 망막 특징 (겹눈 1442 → 6차원)
 │   ├── arena.py                기둥·냄새 마커 배치, 런타임 재배치
 │   ├── env_multimodal.py       ★ 냄새+시각 먹이찾기 환경
-│   ├── olfactory.py            ORN → 촉각엽 → 케니언 세포 희소 부호화
+│   ├── olfactory.py            ORN → 촉각엽 → 케니언 세포 (무작위 배선 / DoOR·hemibrain 배선)
+│   ├── motion_vision.py        T4/T5형 움직임 감지, 시운동 반응, 머리 위 그림자
+│   ├── central_complex.py      나침반·경로 적분·표지 학습·목표 기억
+│   ├── session.py              샌드박스 초파리를 서버 재시작 너머로 저장·복원
+│   ├── data\                   DoOR·hemibrain에서 뽑은 작은 표 (출처: SOURCES.md)
 │   ├── mushroom_body.py        ★ KC→MBON 구획, 도파민 억압, 복원
 │   ├── conditioning.py         ★ 후각 조건화 실험 러너 (gym.Env 아님)
-│   ├── room.py / sandbox.py    샌드박스 방, 자극, 행동, 프리셋 50개, 시행 측정 항목
-│   ├── experiment.py           ★ A/B 실험 세트 22개, 반복 실행, 가설 판정
+│   ├── room.py / sandbox.py    샌드박스 방, 자극, 행동, 프리셋 61개, 시행 측정 항목
+│   ├── experiment.py           ★ A/B 실험 세트 26개, 반복 실행, 가설 판정·효과 크기
 │   └── report.py               탐구보고서(HTML) 생성
 ├── scripts\
 │   ├── 01_view_model.py        모델 뷰어
@@ -651,10 +666,13 @@ flyplay\                        프로젝트 루트
 │   ├── 14_run_conditioning.py  조건화 실험 (구획 / 소거) × 여러 마리 병렬 실행
 │   ├── 15_analyze_mb.py        ★ 학습·역전·절제 표와 그림
 │   ├── 16_memory.py            학습된 기억 보관·목록·상세
-│   └── 17_run_experiment.py    ★ A/B 실험 세트를 CPU 코어 여러 개로 배경 실행 + 보고서
+│   ├── 17_run_experiment.py    ★ A/B 실험 세트를 CPU 코어 여러 개로 배경 실행 + 보고서
+│   ├── 18_build_brain_data.py  DoOR·hemibrain 원본을 받아 flyplay/data 표 만들기
+│   └── 19_eye_azimuths.py      렌더링으로 낱눈마다 보는 방위각 재기
 ├── .venv-v1\                   FlyGym 1.x 환경 (후각/시각/경로적분 튜토리얼용)
 ├── flygym-v1-src\              flygym-gymnasium 저장소 (튜토리얼 12개)
-├── RESEARCH.md                 연구 생태계 조사 + 연구 주제 13개
+├── data\raw\                   내려받은 원본 데이터 (git 제외, 46 MB)
+├── RESEARCH.md                 연구 생태계 조사 + 연구 주제, 15절: 데이터와 문헌
 ├── memories\                   이름 붙여 보관한 버섯체 기억 (.npz)
 ├── STATUS.md                   지금 어디까지 했고 어떻게 이어가는지
 ├── CLAUDE.md                   Claude Code용 작업 안내

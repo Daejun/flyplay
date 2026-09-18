@@ -105,9 +105,11 @@ from flyplay.sandbox import (
     PRESET_NOTES,
     PRESETS,
     SUGARS,
+    RestoreRefused,
     Sandbox,
     load_preset,
 )
+from flyplay.session import SAVE_EVERY_S, Session, SessionLocked
 from flyplay.experiment import (
     EXPERIMENT_SETS,
     EXPERIMENTS_DIR,
@@ -188,13 +190,22 @@ ZOOM_STEP = 1.3
 SANDBOX_TRACE_LEN = 400
 #: Item kinds as the page names them. Only ever used for the page's event log.
 KIND_LABELS = {"sugar": "설탕", "shock": "전기 구역", "odour": "냄새",
-               "patch": "색 바닥", "obstacle": "장애물"}
+               "patch": "색 바닥", "obstacle": "장애물", "drum": "줄무늬 원통", "shadow": "그림자",
+               "heat": "온도 구역", "light": "빛 구역"}
 #: Room edits the page can take back.
 UNDO_DEPTH = 200
 #: One fly's speed in a background experiment, simulated seconds per wall
-#: second: 14 sandbox processes at once ran at 0.44-0.50x each (measured, with
-#: idle threads sleeping). The page's time estimate divides by it.
+#: second, when no finished run says otherwise (`FlyServer._pool_speed`): 14
+#: sandbox processes at once ran at 0.44-0.50x each (measured, with idle threads
+#: sleeping, before the walker's fast path and rendering on the RTX).
 POOL_SPEED_PER_FLY = 0.46
+#: Finished runs the time estimate takes its speed from, newest first, and the
+#: fewest trials a run needs to count. A fixed constant went stale twice in one
+#: evening (faster walker, eyes on the RTX), and one run slowed by other work
+#: on the machine read 0.26x against 0.41-0.46x for its neighbours: hence the
+#: median of several.
+POOL_SPEED_RUNS = 3
+POOL_SPEED_MIN_TRIALS = 10
 #: Worker processes a background experiment uses: 17_run_experiment.py's default.
 POOL_WORKERS = max(1, (os.cpu_count() or 4) - 2)
 #: Page commands that do not touch the live fly. Anything else ends a replay first.
@@ -317,6 +328,9 @@ class FlyServer:
         self._watchers_lock = threading.Lock()
         self._neuro_asked = 0.0
         self._stop = threading.Event()
+        #: The saved sandbox fly this viewer resumes and keeps saving
+        #: (`flyplay.session`), set by `main` before the simulation starts.
+        self.session: Session | None = None
         self.status: dict = {}
         self.neuro_snapshot: dict = {}
 
@@ -343,12 +357,29 @@ class FlyServer:
         if self.sandbox_mode:
             self.meta = {}
             args.terrain = "flat"
-            self.sandbox = Sandbox(seed=args.seed)
+            #: The saved fly to resume once everything below exists.
+            self._saved = None
+            if self.session is not None:
+                if args.fresh:
+                    self.session.set_aside("fresh")
+                else:
+                    try:
+                        self._saved = self.session.load()
+                    except (OSError, ValueError, KeyError) as error:
+                        print(f"session '{self.session.name}': unreadable state set aside "
+                              f"({type(error).__name__})")
+                        self.session.set_aside("unreadable")
+            # A resumed fly keeps its own wiring whatever --seed says.
+            seed = args.seed if self._saved is None else int(self._saved.meta.get("seed", args.seed))
+            self.sandbox = Sandbox(seed=seed)
             load_preset(self.sandbox, args.preset)
             self.fs = self.sandbox.fs
             # The sandbox fly is built plain so its eyes never see coloured legs;
             # only this render gets NeuroMechFly's colours.
             self._display_colours = display_colours(self.fs.fly, self.fs.sim)
+            # The shadow bar crosses over the room's top view: see-through here,
+            # and only here -- the fly's eyes see it dark.
+            self._display_colours[self.sandbox.room.shadow_geom] = np.array([0.05, 0.05, 0.06, 0.3], dtype=np.float32)
             #: Room edits that can be undone, newest last, and those undone.
             self._undo: list[dict] = []
             self._redo: list[dict] = []
@@ -378,6 +409,19 @@ class FlyServer:
             self._sets_payload: dict | None = None
             #: Verdicts for the experiment list, by (directory, finished trials).
             self._verdicts: dict = {}
+            #: (monotonic time worked out, speed) for `_pool_speed`.
+            self._pool_speed_cache: tuple[float, float] | None = None
+            #: Snapshots on their way to disk, written off the simulation thread.
+            self._session_queue: queue.Queue = queue.Queue(maxsize=2)
+            self._last_session_save = time.monotonic()
+            #: Save at the next chance rather than on the clock: a new fly, a
+            #: finished trial.
+            self._session_due = False
+            self._session_error: str | None = None
+            self._session_thread: threading.Thread | None = None
+            if self.session is not None:
+                self._session_thread = threading.Thread(target=self._session_writer, daemon=True)
+                self._session_thread.start()
         elif self.conditioning:
             self.meta = {}
             args.terrain = "flat"  # the protocol lays out its own flat arena
@@ -625,6 +669,84 @@ class FlyServer:
             self._cond_every = max(
                 1, int(round(self.exp.config.action_hz / COND_SAMPLE_HZ))
             )
+        if self.sandbox_mode and self._saved is not None:
+            # Last, so the viewer state it restores exists to be restored into.
+            self._restore_session(self._saved)
+            self._saved = None
+
+    # --- the sandbox session: this fly across restarts (flyplay.session) --
+
+    def _restore_session(self, saved) -> None:
+        sb, name = self.sandbox, self.session.name
+        try:
+            skipped = sb.restore(saved.meta, saved.arrays, (saved.trail, saved.trail_dropped))
+        except RestoreRefused as refused:
+            kept = self.session.set_aside(refused.code)
+            print(f"session '{name}': saved fly not restored ({refused.code}); a new fly starts")
+            sb._event(f"저장된 초파리를 이어 받지 못해 새 파리로 시작합니다: {refused.text}. "
+                      f"예전 상태는 {kept.name if kept else '(없음)'} 파일로 남겼습니다")
+            return
+        viewer = saved.meta.get("viewer") or {}
+        self.preset_name = viewer.get("preset") if viewer.get("preset") in PRESETS else None
+        self.trial_rows = list(viewer.get("trial_rows") or [])
+        self._trial_count = int(viewer.get("trial_count", 0))
+        layout = viewer.get("trial_layout")
+        self._trial_layout = [tuple(entry) for entry in layout] if layout else None
+        self._room_edited = bool(viewer.get("room_edited", False))
+        trial = viewer.get("sb_trial")
+        self.sb_trial = trial if isinstance(trial, dict) and "t0" in trial else None
+        self.paused = bool(viewer.get("paused", False))
+        if viewer.get("speed"):
+            self.speed = float(viewer["speed"])
+        if viewer.get("yaw_rng"):
+            self._yaw_rng.bit_generator.state = viewer["yaw_rng"]
+        saved_at = str(saved.meta.get("saved_at", ""))
+        print(f"session '{name}': resumed the fly saved at {saved_at}")
+        sb._event(f"서버를 다시 시작해 {saved_at}에 저장한 초파리를 이어서 돌립니다 "
+                  f"(기억·배고픔·방·지나온 길·결과표 그대로)")
+        for text in skipped:
+            sb._event(f"다시 놓지 못한 물건: {text}")
+
+    def _save_session(self, *, final: bool = False) -> None:
+        """Hand a snapshot of the live fly to the writer thread. On the
+        simulation thread, between steps. Skipped during a replay, which has
+        the model posed as another fly."""
+        if self.session is None or self.replay is not None:
+            return
+        meta, arrays = self.sandbox.snapshot()
+        meta["viewer"] = {
+            "preset": self.preset_name,
+            "trial_rows": self.trial_rows,
+            "trial_count": self._trial_count,
+            "trial_layout": self._trial_layout,
+            "room_edited": self._room_edited,
+            "sb_trial": self.sb_trial,
+            "paused": self.paused,
+            "speed": self.speed,
+            "yaw_rng": self._yaw_rng.bit_generator.state,
+        }
+        self._last_session_save = time.monotonic()
+        self._session_due = False
+        try:
+            if final:
+                self._session_queue.put((meta, arrays), timeout=10)
+            else:
+                self._session_queue.put_nowait((meta, arrays))
+        except queue.Full:
+            pass  # the writer is behind; the next snapshot carries everything
+
+    def _session_writer(self) -> None:
+        while True:
+            job = self._session_queue.get()
+            if job is None:
+                return
+            try:
+                self.session.write(*job, self.sandbox.trail)
+                self._session_error = None
+            except OSError as error:
+                if self._session_error is None:
+                    self.sandbox._event(f"초파리 상태를 저장하지 못했습니다: {error}")
+                self._session_error = str(error)
 
     def _load_policy(self, run: str):
         from stable_baselines3 import PPO
@@ -933,6 +1055,7 @@ class FlyServer:
             sb.reset_fly()
             self._clear_sandbox_traces()
             self._rewound()
+            self._session_due = True
         elif op == "fly_home":
             sb.return_home()
         elif op == "fly_move":
@@ -1172,7 +1295,7 @@ class FlyServer:
                 [sys.executable, str(Path(__file__).with_name("17_run_experiment.py")), "--dir", str(directory)],
                 cwd=str(_bootstrap.ROOT), stdout=log, stderr=subprocess.STDOUT,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        minutes = estimate_wall_seconds(protocol, POOL_WORKERS, 1.0 / POOL_SPEED_PER_FLY) / 60.0
+        minutes = estimate_wall_seconds(protocol, POOL_WORKERS, 1.0 / self._pool_speed()) / 60.0
         self.sandbox._event(f"배경 실험 시작: {s.title} · 조건마다 파리 {flies}마리 · 약 {max(1, round(minutes))}분"
                             + (" (다른 배경 실험과 CPU를 나눠 쓰므로 더 걸립니다)" if busy else ""))
 
@@ -1260,6 +1383,10 @@ class FlyServer:
                     sb.place(spec["kind"], spec["x"], spec["y"], item_id=item_id, **spec["params"])
                 if item_id in sb.room.items:
                     sb.room.update(item_id, radius=float(radius))
+        # The drum and the shadow where they were at this moment of the trial.
+        moving = {kind: r["t"] for kind in ("drum", "shadow") if sb.room.of_kind(kind)}
+        if moving:
+            sb.room.animate(moving)
         mujoco.mj_forward(model, d)
 
     def _replay_tick(self) -> None:
@@ -1413,9 +1540,32 @@ class FlyServer:
                                            for c in protocol.conditions),
                 })
             groups.append({"group": group, "sets": items})
-        self._sets_payload = {"groups": groups, "rooms": rooms, "workers": POOL_WORKERS,
-                              "speed": POOL_SPEED_PER_FLY}
-        return self._sets_payload
+        self._sets_payload = {"groups": groups, "rooms": rooms, "workers": POOL_WORKERS}
+        return {**self._sets_payload, "speed": self._pool_speed()}
+
+    def _pool_speed(self) -> float:
+        """Simulated seconds per wall second of one worker's fly: the median over
+        the newest finished runs of their own records (simulated time over the
+        wall time each trial took), or `POOL_SPEED_PER_FLY` before any has run.
+        Worked out at most once a minute."""
+        now = time.monotonic()
+        if self._pool_speed_cache is not None and now - self._pool_speed_cache[0] < 60.0:
+            return self._pool_speed_cache[1]
+        rates = []
+        if EXPERIMENTS_DIR.exists():
+            for directory in sorted((d for d in EXPERIMENTS_DIR.iterdir() if d.is_dir()), reverse=True):
+                status = read_json(directory / "status.json", {}) or {}
+                if status.get("state") not in ("done", "stopped"):
+                    continue
+                records = [r for r in self._records(directory) if not r.get("stopped") and r.get("wall_s")]
+                if len(records) < POOL_SPEED_MIN_TRIALS:
+                    continue
+                rates.append(sum(r["seconds"] for r in records) / sum(r["wall_s"] for r in records))
+                if len(rates) == POOL_SPEED_RUNS:
+                    break
+        speed = float(np.median(rates)) if rates else POOL_SPEED_PER_FLY
+        self._pool_speed_cache = (now, speed)
+        return speed
 
     def _exp_status(self, directory: Path, protocol: Protocol) -> dict:
         """State, progress and time left of one experiment directory."""
@@ -1438,7 +1588,7 @@ class FlyServer:
                 elapsed = max(0.0, time.time() - started)
             except (TypeError, ValueError):
                 elapsed = 0.0
-            eta = max(0.0, estimate_wall_seconds(protocol, POOL_WORKERS, 1.0 / POOL_SPEED_PER_FLY) - elapsed)
+            eta = max(0.0, estimate_wall_seconds(protocol, POOL_WORKERS, 1.0 / self._pool_speed()) - elapsed)
         return {"state": state, "done": done, "total": total, "eta_s": None if eta is None else round(eta),
                 "stop_requested": (directory / "STOP").exists()}
 
@@ -1449,7 +1599,8 @@ class FlyServer:
         key = (directory.name, done)
         if key not in self._verdicts:
             result = evaluate(protocol, self._records(directory), protocol.prediction or protocol.expect)
-            self._verdicts[key] = {"code": result["verdict"], "text": VERDICT_TEXT[result["verdict"]]}
+            self._verdicts[key] = {"code": result["verdict"], "text": VERDICT_TEXT[result["verdict"]],
+                                   "needed": result.get("pairs_needed"), "direction": result.get("direction")}
         return self._verdicts[key]
 
     def experiments_list(self) -> list[dict]:
@@ -1471,6 +1622,7 @@ class FlyServer:
             out.append({"id": directory.name, "title": s.title if s else protocol.title, "set": protocol.set_key,
                         "flies": protocol.flies, "created": protocol.created, "prediction": protocol.prediction,
                         "verdict": verdict["text"] if verdict else "", "verdict_code": verdict["code"] if verdict else "",
+                        "needed": verdict["needed"] if verdict else None,
                         **status})
         return out
 
@@ -1502,6 +1654,7 @@ class FlyServer:
             result = evaluate(protocol, records, prediction)
             summary = {"verdict": VERDICT_TEXT[result["verdict"]], "code": result["verdict"],
                        **{k: result.get(k) for k in ("a", "b", "pairs", "a_higher", "a_lower", "ties", "p_sign",
+                                                     "effect", "effect_words", "pairs_needed",
                                                      "direction", "difference", "consistent", "tolerance")},
                        "scores": {side: {str(fly): round(v, 4) for fly, v in result["scores"][side].items()}
                                   for side in ("a", "b")}}
@@ -1514,13 +1667,17 @@ class FlyServer:
                 "prediction": prediction, "prediction_text": prediction_text(s, prediction) if s else prediction,
                 "expect": protocol.expect, "flies": protocol.flies, "created": protocol.created,
                 "replay_flies": protocol.replay_flies, "grid": grid, "summary": summary,
+                # A run of a set since removed still shows; it cannot be run again.
+                "set_exists": s is not None,
                 **self._exp_status(directory, protocol), "done": len(records)}
 
     # --- trials: fixed-length runs whose results collect in a table -------
 
     def _room_snapshot(self) -> list[tuple]:
-        keep = {"sugar": ("sugar", "molar", "volume"), "shock": ("volts", "half"),
-                "patch": ("colour", "half"), "odour": ("odour", "strength"), "obstacle": ("hx", "hy")}
+        keep = {"sugar": ("sugar", "molar", "volume", "bitter"), "shock": ("volts", "half"),
+                "heat": ("temp", "half", "hx", "hy"), "light": ("target", "intensity", "half"),
+                "patch": ("colour", "half"), "odour": ("odour", "strength"), "obstacle": ("hx", "hy"),
+                "drum": ("speed", "pattern"), "shadow": ("interval", "passes", "gap")}
         return [(it.kind, it.x, it.y, {k: it.params[k] for k in keep[it.kind] if k in it.params})
                 for it in self.sandbox.room.items.values()]
 
@@ -1593,6 +1750,7 @@ class FlyServer:
         self._append_trial_csv(row)
         self.sb_trial = None
         self.paused = True
+        self._session_due = True
         sb.refresh_telemetry()
         sb._event(f"실험 {row['번호']} 끝: {elapsed:.1f}초 · 결과표에 기록했습니다")
 
@@ -1647,13 +1805,6 @@ class FlyServer:
         (w0, s0), (w1, s1) = self._speed_samples[0], self._speed_samples[-1]
         return round((s1 - s0) / (w1 - w0), 2) if w1 - w0 > 0.5 else None
 
-    def _nearest_sugar(self) -> float | None:
-        xy = self.fs.thorax_pos()[:2]
-        sugars = self.sandbox.room.of_kind("sugar")
-        if not sugars:
-            return None
-        return round(min(max(0.0, float(np.hypot(xy[0] - s.x, xy[1] - s.y)) - s.half) for s in sugars), 1)
-
     def _draw_shock_outlines(self, scene) -> None:
         """Dashed red outlines of the shock zones, added to this render's scene
         only. The plates themselves are fully transparent, and the fly's eyes
@@ -1661,7 +1812,11 @@ class FlyServer:
         dash, gap, radius = 2.5, 1.5, 0.22
         rgba = np.array([1.0, 0.27, 0.12, 1.0], dtype=np.float32)
         z = 0.08
-        for item in self.sandbox.room.of_kind("shock"):
+        zones = [(item, (1.0, 0.27, 0.12, 1.0)) for item in self.sandbox.room.of_kind("shock")]
+        zones += [(item, (1.0, 0.62, 0.15, 1.0)) for item in self.sandbox.room.of_kind("heat")]
+        zones += [(item, (0.85, 0.35, 1.0, 1.0)) for item in self.sandbox.room.of_kind("light")]
+        for item, colour in zones:
+            rgba = np.array(colour, dtype=np.float32)
             hx, hy = item.extent
             corners = [(item.x - hx, item.y - hy), (item.x + hx, item.y - hy),
                        (item.x + hx, item.y + hy), (item.x - hx, item.y + hy)]
@@ -1710,6 +1865,8 @@ class FlyServer:
             },
             "preset": self.preset_name,
             "sugar_depletes": sb.sugar_depletes,
+            "moving": sb.moving_view(),
+            "cx": sb.cx_view(),
             "sb_trial": trial,
             "trial_rows": self.trial_rows,
             "speed_factor": self._speed_factor(),
@@ -2000,6 +2157,9 @@ class FlyServer:
                 # new preset never appeared (persona test); recompute them.
                 if self._drain_commands() and self.paused and self.replay is None:
                     mujoco.mj_forward(self.fs.sim.mj_model, self.fs.sim.mj_data)
+                if self.session is not None and (
+                        self._session_due or time.monotonic() - self._last_session_save >= SAVE_EVERY_S):
+                    self._save_session()
                 try:
                     self._follow_tick()
                 except (KeyError, ValueError, OSError) as error:
@@ -2012,6 +2172,7 @@ class FlyServer:
                     self.sandbox.reset_fly()
                     self._clear_sandbox_traces()
                     self._speed_samples.clear()
+                    self._session_due = True
                 elif self.conditioning:
                     self._restart_session()
                 elif self.policy is not None:
@@ -2088,6 +2249,13 @@ class FlyServer:
             if not self.paused:
                 pacer.wait(self.fs.sim.time)
 
+        if self.sandbox_mode and self.session is not None:
+            # The live fly back from any replay, then one last save, written
+            # before this thread lets go of the model.
+            self._replay_stop()
+            self._save_session(final=True)
+            self._session_queue.put(None)
+            self._session_thread.join(timeout=15)
         self.renderer.close()
         self.fs.close()
 
@@ -2160,18 +2328,10 @@ class FlyServer:
                 recent_found=sum(1 for o in recent if o in ("found", "goal")),
                 following=self.follow,
             )
-        if self.sandbox_mode:
-            # All odours summed: the first dimension alone is vinegar, and the
-            # first source's position was a parked slot 900 mm away.
-            intensities = self.fs.odor()
-            self.status["odor"] = round(float(intensities.sum(axis=1).mean()), 5)
-            self.status["odor_asym"] = round(float(OdorField.asymmetry(
-                intensities.sum(axis=1, keepdims=True))[0]), 4)
-            nearest = self._nearest_sugar()
-            if nearest is not None:
-                self.status["goal_dist"] = nearest
-            self.status["touching"] = bool(self.sandbox.room.touching_solid())
-        elif self.policy is None and not self.conditioning and self.fs.odor_field is not None:
+        # The sandbox page has no odour / nearest-sugar / wall-contact line: its
+        # values changed length on every poll, re-wrapped the header and shook
+        # the whole layout under it, so there they are neither shown nor computed.
+        if not self.sandbox_mode and self.policy is None and not self.conditioning and self.fs.odor_field is not None:
             intensities = self.fs.odor()
             self.status["odor"] = round(float(intensities[:, 0].mean()), 5)
             self.status["odor_asym"] = round(
@@ -2183,7 +2343,7 @@ class FlyServer:
             self.status["touching"] = bool(self.fs.touching_pillar())
         if self.policy is None and self.retina is not None:
             features = self.retina.extract(
-                self.fs.sim.get_ommatidia_readouts(self.fs.name)
+                self.fs.ommatidia_readouts()
             )
             self.status["vis_asym"] = round(float(features[4]), 4)
             self.status["vis_total"] = round(float(features[5]), 4)
@@ -2272,7 +2432,7 @@ class FlyServer:
         else:
             readouts = getattr(self.env, "last_readouts", None) if self.env else None
             if readouts is None and self.retina is not None:
-                readouts = self.fs.sim.get_ommatidia_readouts(self.fs.name)
+                readouts = self.fs.ommatidia_readouts()
             if readouts is None:
                 return
             panels = [
@@ -2390,6 +2550,11 @@ PAGE = """<!doctype html>
  .stats { display:flex; gap:12px; flex-wrap:wrap; margin-left:auto;
           font-variant-numeric:tabular-nums; color:#cfcfcf; }
  .stats i { color:var(--dim); font-style:normal; margin-right:4px; }
+ /* Values hold a fixed width. Right-aligned, the row slid sideways whenever a
+    number changed length (time 99.99 -> 100.00 s, a minus sign on a position). */
+ .stats b { display:inline-block; text-align:right; }
+ #time { min-width:9ch; } #pos { min-width:15ch; } #spd { min-width:9ch; }
+ #sig { min-width:12ch; } #up { min-width:4ch; } #legs { min-width:5ch; }
 
  /* ---- main: 3D view on the left, instrument rail on the right ---- */
  main { display:grid; gap:8px; min-height:0;
@@ -2824,6 +2989,9 @@ PAGE = """<!doctype html>
           <button class="tool" data-tool="odour">냄새</button>
           <button class="tool" data-tool="patch">색 바닥</button>
           <button class="tool" data-tool="obstacle">장애물</button>
+          <button class="tool" data-tool="moving" title="방 바깥에서 도는 줄무늬 원통과 머리 위로 지나가는 그림자">움직임</button>
+          <button class="tool" data-tool="heat" title="바닥을 데웁니다. 초파리는 다리와 더듬이로 느끼고 눈에는 보이지 않습니다">온도</button>
+          <button class="tool" data-tool="light" title="도파민 뉴런을 빛으로 직접 켜는 구역(광유전학 흉내)">빛</button>
           <button class="tool" data-tool="fly" title="지도를 클릭한 곳으로 초파리를 옮깁니다">초파리</button>
           <button class="tool" data-tool="erase">지우개</button>
           <span class="undo"><button id="b_undo" disabled>↶ 되돌리기</button><button id="b_redo" disabled>↷</button></span>
@@ -2836,6 +3004,7 @@ PAGE = """<!doctype html>
           <b id="p_molar_v">1.00 M</b>
           양 <input id="p_volume" type="range" min="20" max="500" step="10" value="100" title="바꾸면 그 양으로 다시 채워집니다">
           <b id="p_volume_v">100 nl</b>
+          쓴맛 <input id="p_bitter" type="range" min="0" max="1" step="0.1" value="0" title="단맛 세포를 누르고 처벌 도파민을 냅니다"><b id="p_bitter_v">0.0</b>
           <button id="b_deplete" class="on" title="켜짐: 먹는 만큼 줄고 다 먹으면 사라짐 · 꺼짐: 그대로 남음">먹으면 줄어듦: 켜짐</button>
         </div>
         <div class="opts" data-for="shock">
@@ -2856,6 +3025,24 @@ PAGE = """<!doctype html>
           <select id="p_shape"><option value="block">블록</option><option value="wall_h">벽 (가로)</option><option value="wall_v">벽 (세로)</option></select>
           길이 <input id="p_length" type="range" min="4" max="100" step="2" value="8"><b id="p_length_v">8 mm</b>
           <span class="hint">벽 두께 2 mm. 초파리는 닿기 전에 돌아섭니다.</span>
+        </div>
+        <div class="opts" data-for="moving">
+          <button id="b_drum" title="방 바깥의 줄무늬 원통을 켜고 끕니다. 초파리 눈에 보입니다">줄무늬 원통: 꺼짐</button>
+          속도 <input id="p_drum_speed" type="range" min="-180" max="180" step="15" value="60" title="양수는 위에서 볼 때 반시계 방향"><b id="p_drum_speed_v">60°/s</b>
+          <select id="p_drum_pattern"><option value="stripes">줄무늬</option><option value="landmarks">표지 막대</option></select>
+          <button id="b_shadow" title="검은 막대가 머리 위로 지나가게 합니다. 초파리 눈에 보입니다">그림자: 꺼짐</button>
+          간격 <input id="p_shadow_interval" type="range" min="2" max="60" step="1" value="10"><b id="p_shadow_interval_v">10초</b>
+          횟수 <input id="p_shadow_passes" type="range" min="1" max="10" step="1" value="5"><b id="p_shadow_passes_v">5번</b>
+        </div>
+        <div class="opts" data-for="heat">
+          온도 <input id="p_temp" type="range" min="15" max="45" step="1" value="36"><b id="p_temp_v">36 °C</b>
+          크기 <input id="p_half_heat" type="range" min="3" max="50" step="1" value="12"><b id="p_half_heat_v">24 mm</b>
+          <span class="hint">30 °C가 넘으면 처벌 도파민. 방 온도는 25 °C.</span>
+        </div>
+        <div class="opts" data-for="light">
+          <select id="p_light_target"><option value="punish">처벌 도파민</option><option value="reward">보상 도파민</option></select>
+          세기 <input id="p_intensity" type="range" min="0" max="1" step="0.05" value="1"><b id="p_intensity_v">1.00</b>
+          크기 <input id="p_half_light" type="range" min="3" max="30" step="1" value="12"><b id="p_half_light_v">24 mm</b>
         </div>
         <div class="opts" data-for="erase"><span class="hint">지울 물건을 클릭하세요.</span></div>
         <div class="opts" data-for="fly">
@@ -3372,7 +3559,7 @@ const ODOUR_COL = {vinegar:'#f0c030', octanol:'#d85ad8', mch:'#33cccc'};
 const SUGAR_COL = {sucrose:'#fafaeb', fructose:'#ffd98c', arabinose:'#ff99cc', sorbitol:'#b3e6ff',
                    arabinose_sorbitol:'#d9bfff'};
 const MODE_KO = {explore:'탐색', feed:'먹는 중', escape:'도망', wall:'벽 회피', search:'주변 탐색',
-                 retract:'주둥이 접는 중'};
+                 retract:'주둥이 접는 중', freeze:'얼어붙음'};
 const sb = {tool:'sugar', items:[], fly:null, half:50, drag:null, selected:null,
             // The trail as flat x/y pairs, kept in step with the server's (syncTrail).
             tx:[], tEpoch:-1, tTotal:0, tFetching:false, heat:false,
@@ -3478,7 +3665,10 @@ function syncTrail(s) {
     }).catch(() => {}).finally(() => { sb.tFetching = false; });
   }
 }
-const KIND_KO = {sugar:'설탕', shock:'전기', odour:'냄새', patch:'색 바닥', obstacle:'장애물'};
+const KIND_KO = {sugar:'설탕', shock:'전기', odour:'냄새', patch:'색 바닥', obstacle:'장애물', drum:'줄무늬 원통', shadow:'그림자',
+                 heat:'온도', light:'빛'};
+// Things that move by themselves have no place on the floor: set from the 'moving' tool.
+const MOVING = ['drum', 'shadow'];
 
 function mapScale(c) {
   const W = c.canvas.width, H = c.canvas.height;
@@ -3489,11 +3679,13 @@ const toCanvas = (c, x, y) => { const m = mapScale(c); return [m.ox + x * m.s, m
 const toWorld = (c, px, py) => { const m = mapScale(c); return [(px - m.ox) / m.s, (m.oy - py) / m.s]; };
 
 // Half-extents on the map: walls are long boxes, odour markers a small dot.
-const extentOf = it => it.kind === 'obstacle' ? [it.hx, it.hy] : it.kind === 'odour' ? [2.5, 2.5] : [it.half, it.half];
+const extentOf = it => (it.kind === 'obstacle' || (it.kind === 'heat' && it.hx !== undefined)) ? [it.hx, it.hy]
+  : it.kind === 'odour' ? [2.5, 2.5] : MOVING.includes(it.kind) ? [0, 0] : [it.half, it.half];
 // Topmost first: what the pointer should grab when things overlap.
-const HIT_ORDER = {sugar:0, odour:1, obstacle:2, shock:3, patch:4};
+const HIT_ORDER = {sugar:0, odour:1, obstacle:2, shock:3, light:4, patch:5, heat:6, drum:9, shadow:9};
 function hitItems(x, y) {
   return [...sb.items].sort((a, b) => HIT_ORDER[a.kind] - HIT_ORDER[b.kind]).filter(it => {
+    if (MOVING.includes(it.kind)) return false;
     const [hx, hy] = extentOf(it);
     return Math.abs(x - it.x) <= hx && Math.abs(y - it.y) <= hy;
   });
@@ -3502,11 +3694,15 @@ const hitItem = (x, y) => hitItems(x, y)[0];
 
 function describe(it) {
   const at = '위치 (' + it.x.toFixed(0) + ', ' + it.y.toFixed(0) + ')';
-  if (it.kind === 'sugar') return [(SUGAR_KO[it.sugar] || it.sugar) + ' ' + it.molar.toFixed(2) + ' M',
-    '남은 양 ' + Math.round(it.left) + ' / ' + Math.round(it.volume) + ' nl', at];
+  if (it.kind === 'sugar') return [(SUGAR_KO[it.sugar] || it.sugar) + ' ' + it.molar.toFixed(2) + ' M' +
+    (it.bitter ? ' · 쓴맛 ' + it.bitter.toFixed(1) : ''), '남은 양 ' + Math.round(it.left) + ' / ' + Math.round(it.volume) + ' nl', at];
+  if (it.kind === 'heat') return ['바닥 ' + it.temp.toFixed(0) + ' °C', '크기 ' + (2 * extentOf(it)[0]).toFixed(0) + ' x ' + (2 * extentOf(it)[1]).toFixed(0) + ' mm', at];
+  if (it.kind === 'light') return [(it.target === 'reward' ? '보상' : '처벌') + ' 도파민 빛 ' + it.intensity.toFixed(2), '크기 ' + (2 * it.half).toFixed(0) + ' mm', at];
   if (it.kind === 'shock') return ['전기 ' + it.volts.toFixed(0) + ' V', '크기 ' + (2 * it.half).toFixed(0) + ' mm', at];
   if (it.kind === 'odour') return ['냄새 ' + (ODOUR_KO[it.odour] || it.odour), '세기 ' + it.strength.toFixed(2), at];
   if (it.kind === 'patch') return [(it.colour === 'green' ? '초록' : '파랑') + ' 바닥', '크기 ' + (2 * it.half).toFixed(0) + ' mm', at];
+  if (it.kind === 'drum') return ['줄무늬 원통 ' + it.speed.toFixed(0) + '°/s', it.pattern === 'landmarks' ? '표지 막대' : '줄무늬'];
+  if (it.kind === 'shadow') return ['그림자 ' + it.interval.toFixed(0) + '초마다 ' + it.passes + '번'];
   const w = 2 * it.hx, h = 2 * it.hy;
   return [(Math.min(w, h) <= 2.01 && Math.max(w, h) > 2.01 ? '벽 ' : '블록 ') + w.toFixed(0) + ' x ' + h.toFixed(0) + ' mm', at];
 }
@@ -3542,6 +3738,21 @@ function drawMap(c) {
   if (sb.heat) drawHeat(c, m, h, trailXY, replaying ? Infinity : sb.trailSeconds, perSecond);
   // Shock zones have no colour anywhere (user request): a dashed outline and
   // the voltage, so they cannot be mistaken for floor colour the fly sees.
+  // Heat: warm-coloured floor, on the map only (the fly feels it, never sees it).
+  sb.items.filter(i => i.kind === 'heat').forEach(it => {
+    const [hx, hy] = extentOf(it), [cx, cy] = toCanvas(c, it.x, it.y);
+    const warm = Math.max(0, Math.min(1, (it.temp - 25) / 15));
+    c.fillStyle = it.temp >= 25 ? `rgba(255,120,40,${(0.12 + 0.3 * warm).toFixed(2)})` : 'rgba(80,160,255,0.2)';
+    c.fillRect(cx - hx * m.s, cy - hy * m.s, 2 * hx * m.s, 2 * hy * m.s);
+    if (full) label(it, it.temp.toFixed(0) + ' °C', '#ffb070');
+  });
+  // Light zones: a dashed purple outline, dopamine by light.
+  sb.items.filter(i => i.kind === 'light').forEach(it => {
+    const [cx, cy] = toCanvas(c, it.x, it.y), r = it.half * m.s;
+    c.setLineDash([2, 3]); c.strokeStyle = it.target === 'reward' ? '#8fe06a' : '#d98cff'; c.lineWidth = 1.5;
+    c.strokeRect(cx - r, cy - r, 2 * r, 2 * r); c.setLineDash([]);
+    if (full || simple) label(it, '💡' + (it.target === 'reward' ? '+' : '-'), it.target === 'reward' ? '#8fe06a' : '#d98cff');
+  });
   sb.items.filter(i => i.kind === 'shock').forEach(it => {
     const [cx, cy] = toCanvas(c, it.x, it.y), r = it.half * m.s;
     c.setLineDash([5, 4]); c.strokeStyle = '#ff6040'; c.lineWidth = 1.5;
@@ -3550,6 +3761,21 @@ function drawMap(c) {
     else if (simple) label(it, '⚡', '#ff8a70');
   });
   sb.items.filter(i => i.kind === 'obstacle').forEach(it => box(it, '#6b6b72', '#9a9aa2'));
+  // The drum: a ring of stripes just outside the room, turned as it is now.
+  const drum = sb.items.find(i => i.kind === 'drum');
+  if (drum) {
+    const [cx, cy] = toCanvas(c, 0, 0), R = (h + 3) * m.s, turn = ((sb.moving || {}).drum_deg || 0) * Math.PI / 180;
+    const dark = drum.pattern === 'landmarks' ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 18, 25, 26, 27] : [...Array(18).keys()].map(k => 2 * k);
+    c.strokeStyle = '#cfcfd6'; c.lineWidth = Math.max(3, 2.2 * m.s);
+    dark.forEach(k => {
+      const a0 = turn + k * Math.PI / 18, a1 = a0 + Math.PI / 18;
+      c.beginPath(); c.arc(cx, cy, R, -a1, -a0); c.stroke();
+    });
+    if (simple || full) {
+      c.font = '11px ui-sans-serif,system-ui,sans-serif'; c.fillStyle = '#cfcfd6';
+      c.fillText((drum.speed >= 0 ? '↺ ' : '↻ ') + Math.abs(drum.speed).toFixed(0) + '°/s', cx - R, cy - R - 4);
+    }
+  }
   // Trail: the last trailSeconds (10 points a second), older parts fainter. Drawn
   // as 24 paths of one alpha each, not a stroke per segment: an hour is 36,000
   // segments. With no limit the oldest part stays visible instead of fading out.
@@ -3586,6 +3812,12 @@ function drawMap(c) {
     c.beginPath(); c.arc(cx, cy, 3, 0, 2 * Math.PI); c.fill();
     if (full) { c.font = '11px ui-sans-serif,system-ui,sans-serif'; c.fillText(ODOUR_KO[it.odour] || it.odour, cx + 6, cy + 12); }
   });
+  // The shadow bar while it passes overhead, drawn see-through over the room.
+  const shadowX = (sb.moving || {}).shadow_x;
+  if (sb.items.some(i => i.kind === 'shadow') && shadowX !== undefined && shadowX !== null) {
+    const [sx] = toCanvas(c, shadowX, 0), [, top] = toCanvas(c, 0, h + 20), [, bottom] = toCanvas(c, 0, -h - 20);
+    c.fillStyle = 'rgba(10,10,14,0.55)'; c.fillRect(sx - 10 * m.s, top, 20 * m.s, bottom - top);
+  }
   if (sb.selected !== null) {
     const it = sb.items.find(i => i.id === sb.selected);
     if (it) {
@@ -3593,6 +3825,19 @@ function drawMap(c) {
       c.setLineDash([4, 3]); c.strokeStyle = '#ffffff'; c.lineWidth = 1.2;
       c.strokeRect(cx - hx * m.s - 4, cy - hy * m.s - 4, 2 * hx * m.s + 8, 2 * hy * m.s + 8); c.setLineDash([]);
     }
+  }
+  // What the fly believes: its remembered cool place (star) and last meal
+  // (cross), placed through its own drifting sense of direction.
+  if (sb.cx && sb.fly) {
+    const mark = (pt, col, draw) => { if (!pt) return; const [px, py] = toCanvas(c, pt[0], pt[1]); c.strokeStyle = col; c.fillStyle = col; draw(px, py); };
+    mark(sb.cx.goal, '#8fd4ff', (px, py) => {
+      c.globalAlpha = Math.max(0.35, sb.cx.goal_strength); c.font = '16px ui-sans-serif,system-ui,sans-serif';
+      c.fillText('☆', px - 8, py + 6); c.globalAlpha = 1;
+      if (full) c.fillText('기억한 곳', px + 9, py + 4);
+    });
+    mark(sb.cx.food, '#f5e6a8', (px, py) => {
+      c.lineWidth = 1.5; c.beginPath(); c.moveTo(px - 4, py - 4); c.lineTo(px + 4, py + 4); c.moveTo(px + 4, py - 4); c.lineTo(px - 4, py + 4); c.stroke();
+    });
   }
   if (sb.fly && sb.flyDrag) {
     const [gx, gy] = toCanvas(c, sb.flyDrag.x, sb.flyDrag.y), a = -sb.fly.yaw, L = Math.max(7, 3.2 * m.s);
@@ -3657,7 +3902,10 @@ function obstacleParams() {
 }
 function currentParams(kind) {
   if (kind === 'sugar') return {sugar: p_sugar.value, molar: parseFloat(p_molar.value),
-                                volume: parseFloat(p_volume.value)};
+                                volume: parseFloat(p_volume.value), bitter: parseFloat(p_bitter.value)};
+  if (kind === 'heat') return {temp: parseFloat(p_temp.value), half: parseFloat(p_half_heat.value)};
+  if (kind === 'light') return {target: p_light_target.value, intensity: parseFloat(p_intensity.value),
+                                half: parseFloat(p_half_light.value)};
   if (kind === 'shock') return {volts: parseFloat(p_volts.value), half: parseFloat(p_half_shock.value)};
   if (kind === 'odour') return {odour: p_odour.value, strength: parseFloat(p_strength.value)};
   if (kind === 'patch') return {colour: p_colour.value, half: parseFloat(p_half_patch.value)};
@@ -3668,6 +3916,9 @@ const labelsFor = {
   p_molar: v => v.toFixed(2) + ' M', p_volume: v => v.toFixed(0) + ' nl', p_volts: v => v.toFixed(0) + ' V',
   p_half_shock: v => (2 * v).toFixed(0) + ' mm', p_strength: v => v.toFixed(2),
   p_half_patch: v => (2 * v).toFixed(0) + ' mm', p_length: v => v.toFixed(0) + ' mm',
+  p_drum_speed: v => v.toFixed(0) + '°/s', p_shadow_interval: v => v.toFixed(0) + '초', p_shadow_passes: v => v.toFixed(0) + '번',
+  p_bitter: v => v.toFixed(1), p_temp: v => v.toFixed(0) + ' °C', p_half_heat: v => (2 * v).toFixed(0) + ' mm',
+  p_intensity: v => v.toFixed(2), p_half_light: v => (2 * v).toFixed(0) + ' mm',
 };
 const refreshLabel = id => { const out = document.getElementById(id + '_v');
   if (out && labelsFor[id]) out.textContent = labelsFor[id](parseFloat(document.getElementById(id).value)); };
@@ -3676,7 +3927,9 @@ const refreshLabel = id => { const out = document.getElementById(id + '_v');
 // changes only that setting.
 function loadParams(it) {
   const set = (id, v) => { const el = document.getElementById(id); el.value = v; refreshLabel(id); };
-  if (it.kind === 'sugar') { p_sugar.value = it.sugar; set('p_molar', it.molar); set('p_volume', it.volume); }
+  if (it.kind === 'sugar') { p_sugar.value = it.sugar; set('p_molar', it.molar); set('p_volume', it.volume); set('p_bitter', it.bitter || 0); }
+  if (it.kind === 'heat') { set('p_temp', it.temp); set('p_half_heat', it.half); }
+  if (it.kind === 'light') { p_light_target.value = it.target; set('p_intensity', it.intensity); set('p_half_light', it.half); }
   if (it.kind === 'shock') { set('p_volts', it.volts); set('p_half_shock', it.half); }
   if (it.kind === 'odour') { p_odour.value = it.odour; set('p_strength', it.strength); }
   if (it.kind === 'patch') { p_colour.value = it.colour; set('p_half_patch', it.half); }
@@ -3763,6 +4016,13 @@ function setupPalette(s) {
   edit(p_sugar, only('sugar', () => ({sugar: p_sugar.value})));
   edit(p_molar, only('sugar', () => ({molar: parseFloat(p_molar.value)})));
   edit(p_volume, only('sugar', () => ({volume: parseFloat(p_volume.value)})));
+  edit(p_bitter, only('sugar', () => ({bitter: parseFloat(p_bitter.value)})));
+  edit(p_temp, only('heat', () => ({temp: parseFloat(p_temp.value)})));
+  // A heat zone drawn as a rectangle (a preset's) becomes a square when resized here.
+  edit(p_half_heat, only('heat', () => ({half: parseFloat(p_half_heat.value), hx: parseFloat(p_half_heat.value), hy: parseFloat(p_half_heat.value)})));
+  edit(p_light_target, only('light', () => ({target: p_light_target.value})));
+  edit(p_intensity, only('light', () => ({intensity: parseFloat(p_intensity.value)})));
+  edit(p_half_light, only('light', () => ({half: parseFloat(p_half_light.value)})));
   edit(p_volts, only('shock', () => ({volts: parseFloat(p_volts.value)})));
   edit(p_half_shock, only('shock', () => ({half: parseFloat(p_half_shock.value)})));
   edit(p_odour, only('odour', () => ({odour: p_odour.value})));
@@ -3776,6 +4036,28 @@ function setupPalette(s) {
   });
   edit(p_shape, only('obstacle', obstacleParams));
   edit(p_length, only('obstacle', obstacleParams));
+  // The moving stimuli: one of each, switched on and off here and edited in place.
+  const movingParams = kind => kind === 'drum'
+    ? {speed: parseFloat(p_drum_speed.value), pattern: p_drum_pattern.value}
+    : {interval: parseFloat(p_shadow_interval.value), passes: parseInt(p_shadow_passes.value), gap: 1.0};
+  const toggleMoving = kind => {
+    const it = sb.items.find(i => i.kind === kind);
+    if (it) sbPost({op:'remove', id: it.id});
+    else sbPost({op:'place', kind, x: 0, y: 0, ...movingParams(kind)});
+  };
+  b_drum.onclick = () => toggleMoving('drum');
+  b_shadow.onclick = () => toggleMoving('shadow');
+  [[p_drum_speed, 'drum'], [p_drum_pattern, 'drum'], [p_shadow_interval, 'shadow'], [p_shadow_passes, 'shadow']].forEach(([el, kind]) => {
+    el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', () => {
+      refreshLabel(el.id);
+      el._editing = true;
+      const it = sb.items.find(i => i.kind === kind);
+      if (!it) return;
+      if (!el._gesture) el._gesture = 'moving' + Date.now() + Math.random();
+      sbPost({op:'update', id: it.id, ...movingParams(kind), gesture: el._gesture});
+    });
+    el.addEventListener('change', () => { el._gesture = null; el._editing = false; });
+  });
   Object.keys(labelsFor).forEach(refreshLabel);
   p_labels.onchange = () => { sb.labels = p_labels.value; drawMap(document.getElementById('c_map').getContext('2d')); };
   p_heat.onclick = () => { sb.heat = !sb.heat; p_heat.classList.toggle('on', sb.heat);
@@ -3951,7 +4233,7 @@ const lab = {open:false, view:'home', sets:null, byKey:{}, rooms:{}, list:[], lo
 const STATE_KO = {starting:'준비 중', running:'진행 중', reporting:'정리 중', done:'끝남', stopped:'멈춤', failed:'실패'};
 const ROLE_KO = {train:'훈련', test:'시험', repeat:'반복'};
 const VERDICT_CLASS = {supported:'good', leaning:'lean', opposite:'bad'};
-const UNITS = ['초', '%', 'nl', 'mm', 'mm/s'];
+const UNITS = ['초', '%', 'nl', 'mm', 'mm/s', '°/s', '번'];
 const fmtNum = v => Number.isInteger(v) ? String(v) : Math.abs(v) >= 10 ? v.toFixed(0) : Math.abs(v) >= 1 ? v.toFixed(1) : v.toFixed(2);
 const isRunning = e => ['starting', 'running', 'reporting'].includes(e.state);
 const donePct = e => e.total ? Math.round(100 * e.done / e.total) : 0;
@@ -4203,7 +4485,10 @@ function renderLabSet() {
 function renderLabRun() {
   const s = lab.byKey[lab.key], out = document.getElementById('lab_flies_v');
   if (!s || !out) return;
-  out.textContent = lab.flies + '마리씩, 모두 ' + 2 * lab.flies + '마리 · 약 ' + etaMinutes(s, lab.flies) + '분';
+  // The newest finished run of this set that says how many flies its difference needs.
+  const past = lab.list.find(e => e.set === lab.key && e.needed != null && !isRunning(e));
+  out.textContent = lab.flies + '마리씩, 모두 ' + 2 * lab.flies + '마리 · 약 ' + etaMinutes(s, lab.flies) + '분' +
+    (past ? ' · 지난 실험으로 보면 약 ' + past.needed + '마리가 필요합니다' : '');
   document.getElementById('lab_start').disabled = !lab.choice || !!lab.starting;
   document.getElementById('lab_hint').textContent = lab.starting ? '실험을 준비하고 있습니다…'
     : !lab.choice ? '먼저 위에서 가설을 고르세요' : '시작하면 결과 화면으로 넘어가고, 실험은 배경에서 돕니다.';
@@ -4254,7 +4539,7 @@ function renderLabHead() {
       (isRunning(e) && e.stop_requested ? ' · 멈추는 중' : '') + '</div>' +
       '<div class="resheadbtns">' + (isRunning(e) && !e.stop_requested ? '<button id="lr_stop">■ 멈추기</button>' : '') +
       '<button id="lr_report" class="primary">탐구 보고서 열기</button>' +
-      '<button id="lr_again">같은 질문으로 다시 실험</button></div></div>';
+      (d.set_exists ? '<button id="lr_again">같은 질문으로 다시 실험</button>' : '') + '</div></div>';
   }
   if (html !== lab.headHtml) { lab.headHtml = html; lr_head.innerHTML = html; }
 }
@@ -4277,11 +4562,25 @@ function renderLabVerdict() {
     if (sm.code !== 'too_few' && sm.a_higher + sm.a_lower > 0)
       html += '<p class="lbl">A와 B가 사실 똑같다면, 동전을 ' + (sm.a_higher + sm.a_lower) + '번 던져 이만큼 한쪽으로 몰릴 확률은 약 ' +
         Math.round(100 * sm.p_sign) + '%입니다. 작을수록 우연이 아닐 가능성이 큽니다.</p>';
+    if (sm.code !== 'too_few' && sm.effect_words) html += sizeWords(sm, d.flies);
     html += '<div class="labchart">' + labChart(d) + '</div>' +
       '<p class="lbl">점 하나가 파리 한 마리(' + esc(d.phase) + '의 평균), 굵은 가로선이 평균, 회색 선이 같은 번호의 쌍둥이입니다.' +
       (d.latency ? ' 시행 시간 안에 일어나지 않았으면 시행 시간으로 셉니다(표에서 + 표시).' : '') + '</p>';
   }
   lr_verdict.innerHTML = html;
+}
+// How big the difference is, and the flies a believable result needs
+// (flyplay.experiment.pairs_needed; the report words it the same way).
+function sizeWords(sm, flies) {
+  const ratio = Math.abs(sm.effect);
+  let html = '<p>차이의 크기: <b>' + esc(sm.effect_words) + '</b> <span class="lbl">(쌍마다 난 차이의 평균이 흔들리는 폭의 ' +
+    (ratio >= 99 ? '99배 넘게' : fmtNum(ratio) + '배') + ')</span><br>';
+  if (sm.direction === 'same') html += '차이가 허용 범위 안이라 파리를 늘려도 다르다고 말하기 어렵습니다.';
+  else if (sm.pairs_needed == null) html += '쌍마다 방향이 엇갈려 조건마다 파리를 200마리 넘게 써도 확실해지기 어렵습니다.';
+  else if (sm.pairs_needed <= flies) html += '이 차이는 지금 파리 수(조건마다 ' + flies + '마리)로 충분히 보입니다.';
+  else html += '이 차이를 확실히 보이려면 조건마다 파리가 약 <b>' + sm.pairs_needed + '마리</b> 필요합니다 (지금 ' + flies + '마리).' +
+    (sm.pairs_needed > 30 ? ' 실험실에서 고를 수 있는 30마리보다 많습니다.' : '');
+  return html + '</p><p class="lbl">확실히: 같은 실험을 10번 되풀이하면 8번은 동전 던지기 확률이 5%보다 작게 나오는 파리 수입니다.</p>';
 }
 function niceStep(span, n) {
   const raw = span / n, mag = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / mag;
@@ -4441,7 +4740,7 @@ lab_result.onclick = ev => {
     setTimeout(() => labRefresh(true), 800);
   }
   if (el.closest('#lr_report')) window.open('/report?id=' + encodeURIComponent(lab.id), '_blank');
-  if (el.closest('#lr_again') && lab.detail) {
+  if (el.closest('#lr_again') && lab.detail && lab.detail.set_exists) {
     lab.key = lab.detail.set; lab.flies = lab.detail.flies; lab.choice = lab.detail.prediction;
     labGo('set');
   }
@@ -4508,6 +4807,14 @@ function renderSandbox(s) {
   b_redo.disabled = !s.redo;
   b_redo.title = s.redo ? '다시 하기: ' + s.redo + ' (Ctrl+Y)' : '다시 할 편집이 없습니다';
   b_deplete.textContent = '먹으면 줄어듦: ' + (s.sugar_depletes ? '켜짐' : '꺼짐');
+  const drum = sb.items.find(i => i.kind === 'drum'), shadow = sb.items.find(i => i.kind === 'shadow');
+  sb.moving = s.moving || {};
+  sb.cx = s.cx || null;
+  b_drum.classList.toggle('on', !!drum); b_drum.textContent = '줄무늬 원통: ' + (drum ? '켜짐' : '꺼짐');
+  b_shadow.classList.toggle('on', !!shadow); b_shadow.textContent = '그림자: ' + (shadow ? '켜짐' : '꺼짐');
+  const follow = (el, v) => { if (v !== undefined && !el._editing && document.activeElement !== el) { el.value = v; refreshLabel(el.id); } };
+  if (drum) { follow(p_drum_speed, drum.speed); follow(p_drum_pattern, drum.pattern); }
+  if (shadow) { follow(p_shadow_interval, shadow.interval); follow(p_shadow_passes, shadow.passes); }
   const sel = sb.items.find(i => i.id === sb.selected);
   selbar.classList.toggle('on', !!sel);
   p_selected.textContent = sel ? '고름: ' + KIND_KO[sel.kind] + ' (' + sel.x.toFixed(0) + ', ' + sel.y.toFixed(0) + ')' : '-';
@@ -4651,12 +4958,15 @@ function applyMode(s) {
     document.querySelector('footer').insertBefore(learncard, dancard);
     protocol.style.display = 'none';
     if (CAPS.intro === undefined) CAPS.intro = intro.innerHTML;
-    intro.innerHTML = '<b>샌드박스</b> — 사각 밀폐 방에 설탕·전기·냄새·색 바닥·장애물을 마음대로 놓고 초파리의 반응을 봅니다. ' +
-      '<b>타고난 반응</b>: 배고프면 단맛 나는 설탕 위에서 멈춰 먹고, 전기에 닿으면 돌아서 달아나고, 벽에는 닿기 전에 돌아섭니다. ' +
-      '<b>학습</b>: 도파민이 나오는 순간 맡고 있던 냄새·보고 있던 색이 기억되어, 다음부터 멀리서도 다가가거나 피합니다.';
+    intro.innerHTML = '<b>샌드박스</b> — 사각 밀폐 방에 설탕·전기·냄새·색 바닥·장애물·온도·빛·움직이는 자극을 마음대로 놓고 초파리의 반응을 봅니다. ' +
+      '<b>타고난 반응</b>: 배고프면 단맛 나는 설탕 위에서 멈춰 먹고, 전기에 닿으면 돌아서 달아나고, 벽을 따라 걷되 닿기 전에 돌아서고, ' +
+      '뜨거운 바닥 경계에서 되돌아서고, 도는 줄무늬를 따라 돌고, 머리 위 그림자에 얼어붙거나 빨라집니다. ' +
+      '<b>학습</b>: 도파민이 나오는 순간 맡고 있던 냄새·보고 있던 색이 버섯체에 기억되고(실제 수용체 반응과 hemibrain 배선), ' +
+      '뜨거운 바닥에서 찾은 시원한 곳은 중심복합체가 방 바깥 표지를 기준으로 기억합니다.';
     explainnow.innerHTML = '해 볼 것: 전기 구역에 <b>파란 바닥</b>을 겹쳐 두면 몇 번 맞은 뒤 파랑을 피하는지, 설탕에 <b>식초</b>를 ' +
-      '겹쳐 두면 식초 쪽으로 곧장 가는지, 배고픔을 0으로 내리면 설탕을 지나치는지 보세요. 한계: 단서 없는 <b>장소</b>는 기억하지 ' +
-      '못하고(중심복합체 몫, 아직 없음), 냄새는 지금 장애물을 통과해 퍼집니다. 소르비톨은 맛이 없어 초파리가 먹기 시작하지 않습니다.';
+      '겹쳐 두면 식초 쪽으로 곧장 가는지, <b>뜨거운 바닥</b> 프리셋에서 시원한 칸(지도의 ☆가 기억한 곳)을 점점 빨리 찾는지 보세요. ' +
+      '한계: 냄새는 공기 흐름 없이 벽을 돌아가는 거리로만 퍼지고, 중심복합체는 시원한 곳 말고는 장소를 목표로 삼지 않습니다. ' +
+      '소르비톨은 맛이 없어 초파리가 먹기 시작하지 않습니다.';
     wantEyes = false;
     syncStreams();
     document.querySelector('[data-act=reset]').textContent = '새 파리 (방은 그대로)';
@@ -4932,6 +5242,21 @@ def make_handler(server: FlyServer):
         def log_message(self, *a):  # quiet
             pass
 
+        def handle_one_request(self):
+            """As the base class, minus the traceback for a dropped socket.
+
+            With `protocol_version = "HTTP/1.1"` every connection is kept
+            alive, and a browser closing one -- a tab closed, a reload, a
+            video stream swapped by `syncStreams` -- reaches the reader as
+            WinError 10053 or 10054. `socketserver` prints the whole stack
+            for it, which fills the console the desktop shortcut opens with
+            what look like crashes and are not.
+            """
+            try:
+                super().handle_one_request()
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                self.close_connection = True
+
         def do_GET(self):
             if self.path == "/":
                 body = PAGE.encode("utf-8")
@@ -5191,6 +5516,21 @@ def main() -> None:
         help="Room the sandbox starts with (default: %(default)s).",
     )
     parser.add_argument(
+        "--session",
+        default="main",
+        metavar="NAME",
+        help="With --sandbox: the saved fly to resume and keep saving, in "
+        "out/sandbox/sessions/NAME (default: %(default)s). Its memory, hunger, "
+        "room, trail and results table survive a restart; the room it was in "
+        "replaces --preset. An empty name keeps nothing.",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="With --sandbox: start a new fly instead of resuming the session. "
+        "The saved state is kept beside it under a dated name.",
+    )
+    parser.add_argument(
         "--modality",
         default="odour",
         choices=("odour", "colour"),
@@ -5264,7 +5604,17 @@ def main() -> None:
     if args.speed is None:
         args.speed = 1.0 if (args.conditioning or args.sandbox) else 0.5
 
+    session = None
+    if args.sandbox and args.session:
+        session = Session(_bootstrap.OUT / "sandbox" / "sessions", args.session)
+        try:
+            session.acquire()
+        except SessionLocked:
+            raise SystemExit(f"session '{args.session}' is open in another viewer. Stop that "
+                             f"viewer, or pass --session with another name.")
+
     server = FlyServer(args)
+    server.session = session
     sim_thread = threading.Thread(target=server.run, daemon=True)
     sim_thread.start()
     server.ready.wait()  # the model is built on that thread; wait for it
@@ -5303,6 +5653,10 @@ def main() -> None:
     finally:
         server.stop()
         httpd.server_close()
+        # The simulation thread saves the session on its way out.
+        sim_thread.join(timeout=30)
+        if session is not None:
+            session.release()
 
 
 if __name__ == "__main__":

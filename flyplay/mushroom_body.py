@@ -60,6 +60,8 @@ the cell counts. Without vision the arrays are the olfactory ones, untouched.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -100,6 +102,15 @@ class Compartment:
         recovery: Rate of return to `w0`.
         w_min: Floor on a synapse. Zero -- a synapse cannot go negative, and
             without the floor the depression term can drive weights past it.
+        cells: The Kenyon cells whose axons run through this compartment, as a
+            boolean mask, or None for all of them. A gamma1pedc MBON reads
+            gamma cells only; the others' synapses stay at `w0` and count for
+            nothing.
+        coverage: The share of a code these cells carry (the lobes' share of
+            the population, when the front end fixes it). Input is divided by
+            it, so a novel odour still reads `w0` and full depression still
+            reads 0: the MBON's gain matches the part of the mushroom body it
+            sees.
     """
 
     name: str
@@ -109,13 +120,24 @@ class Compartment:
     eta: float = DEFAULT_ETA
     recovery: float = DEFAULT_RECOVERY
     w_min: float = 0.0
+    cells: np.ndarray | None = None
+    coverage: float = 1.0
     weights: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
         self.weights = np.full(self.n_kc, float(self.w0))
+        if self.cells is not None:
+            self.cells = np.asarray(self.cells, dtype=bool)
+            if self.cells.shape != (self.n_kc,):
+                raise ValueError(f"cells mask has shape {self.cells.shape}, expected ({self.n_kc},)")
 
     def reset(self) -> None:
         self.weights[:] = self.w0
+
+    def _input(self, kc: np.ndarray) -> np.ndarray:
+        if self.cells is None:
+            return kc
+        return np.where(self.cells, kc, 0.0) / self.coverage
 
     def response(self, kc: np.ndarray) -> float:
         """MBON output for a Kenyon-cell pattern.
@@ -124,7 +146,12 @@ class Compartment:
         that odour happens to activate -- `w0` for a novel odour, less for one
         that has been paired with dopamine.
         """
-        return float(self.weights @ kc)
+        return float(self.weights @ self._input(kc))
+
+    def below_rest(self, kc: np.ndarray) -> float:
+        """How far a pattern's synapses sit below rest here: 0 for anything
+        never paired with this compartment's dopamine."""
+        return float((self.w0 - self.weights) @ self._input(kc))
 
     def learn(self, kc: np.ndarray, dan: float, dt: float) -> None:
         """Apply one step of depression and recovery.
@@ -134,7 +161,7 @@ class Compartment:
         memory is what survives that pull.
         """
         if dan > 0.0:
-            self.weights -= self.eta * dan * kc * dt
+            self.weights -= self.eta * dan * self._input(kc) * dt
         self.weights += self.recovery * (self.w0 - self.weights) * dt
         np.clip(self.weights, self.w_min, None, out=self.weights)
 
@@ -241,6 +268,29 @@ class MushroomBody:
         for compartment in self.compartments:
             compartment.reset()
 
+    def wiring_signature(self) -> str:
+        """A fingerprint of everything fixed between the senses and the synapses.
+
+        Two mushroom bodies with the same signature give every Kenyon cell the
+        same meaning, so synapses learned on one mean the same on the other.
+        Saved weights carry it (`flyplay.session`): loaded onto a front end that
+        codes smells or colours differently, they would sit on the wrong cells
+        and nothing would complain.
+        """
+        front = self.front_end
+        digest = hashlib.sha256(json.dumps({
+            "olfactory": [front.n_dimensions, front.n_receptors, front.n_kc, front.k,
+                          front.hill_k, front.sigma, front.min_drive],
+            "visual": self.visual.params if self.visual is not None else None,
+        }, sort_keys=True).encode())
+        arrays = [front.affinity, front.projection]
+        if self.visual is not None:
+            arrays += [self.visual.patches, self.visual.projection]
+        arrays += [c.cells for c in self.compartments if c.cells is not None]
+        for array in arrays:
+            digest.update(np.ascontiguousarray(array).tobytes())
+        return digest.hexdigest()[:16]
+
     # --- readout and learning -------------------------------------------
 
     def embed(
@@ -280,7 +330,9 @@ class MushroomBody:
         """
         if self.visual is None or self.visual_blocked:
             return np.zeros(2)
-        signed = sum(c.sign * c.weights[self.n_olfactory :] for c in self.compartments)
+        signed = sum(c.sign * np.where(c.cells, c.weights, 0.0)[self.n_olfactory :] / c.coverage
+                     if c.cells is not None else c.sign * c.weights[self.n_olfactory :]
+                     for c in self.compartments)
         return self.visual_scale * (visual.kc @ signed)
 
     def read(self, concentration: np.ndarray, readouts: np.ndarray | None = None) -> MushroomBodyState:

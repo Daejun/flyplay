@@ -67,7 +67,7 @@ def sweep_pillar(bearings_deg, distance=6.0):
     empty = build("flat", vision=True, colorize=False)
     empty.sim.reset()
     empty.sim.warmup(0.2)
-    baseline = empty.sim.get_ommatidia_readouts(empty.name)
+    baseline = empty.ommatidia_readouts()
     retina.calibrate_horizon(baseline)
     base_features = retina.extract(baseline)
     empty.close()
@@ -79,7 +79,7 @@ def sweep_pillar(bearings_deg, distance=6.0):
         fs = build("flat", vision=True, pillars=(pos,), colorize=False)
         fs.sim.reset()
         fs.sim.warmup(0.2)
-        readouts = fs.sim.get_ommatidia_readouts(fs.name)
+        readouts = fs.ommatidia_readouts()
         rows.append(
             {
                 "bearing": bearing,
@@ -99,15 +99,15 @@ def crosstalk_check():
     empty = build("flat", vision=True, colorize=False)
     empty.sim.reset()
     empty.sim.warmup(0.2)
-    retina.calibrate_horizon(empty.sim.get_ommatidia_readouts(empty.name))
-    base = retina.extract(empty.sim.get_ommatidia_readouts(empty.name))
+    retina.calibrate_horizon(empty.ommatidia_readouts())
+    base = retina.extract(empty.ommatidia_readouts())
     empty.close()
 
     # Odour source in front. Its marker sits in geom group 2.
     with_odor = build("flat", vision=True, odor_field=field, colorize=False)
     with_odor.sim.reset()
     with_odor.sim.warmup(0.2)
-    odor_view = retina.extract(with_odor.sim.get_ommatidia_readouts(with_odor.name))
+    odor_view = retina.extract(with_odor.ommatidia_readouts())
     with_odor.close()
 
     # Pillar in front, no odour source -- sensors should read zero.
@@ -119,7 +119,7 @@ def crosstalk_check():
     with_pillar.sim.warmup(0.2)
     pillar_odor = with_pillar.odor()
     pillar_view = retina.extract(
-        with_pillar.sim.get_ommatidia_readouts(with_pillar.name)
+        with_pillar.ommatidia_readouts()
     )
     with_pillar.close()
 
@@ -139,7 +139,7 @@ def floor_colour_check():
     fs.sim.warmup(0.2)
 
     def means():
-        own = photoreceptors(fs.sim.get_ommatidia_readouts(fs.name))
+        own = photoreceptors(fs.ommatidia_readouts())
         # (eye, yellow-type mean, pale-type mean)
         return [(own[e][band & ~pale].mean(), own[e][band & pale].mean()) for e in (0, 1)]
 
